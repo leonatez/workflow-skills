@@ -12,6 +12,7 @@ A multi-agent app development workflow for [Claude Code](https://claude.ai/code)
 | [`frontend-pm.md`](frontend-pm.md) | **Frontend PM** | Owns everything the user sees. Produces user stories, wireframes, high-fidelity HTML mockups, and test cases — in that order, with approval gates. |
 | [`backend-pm.md`](backend-pm.md) | **Backend PM** | Owns the API, data models, auth, and infrastructure. FastAPI + Supabase stack. Produces architecture doc, OpenAPI spec, structured logging, and power-admin test account. |
 | [`qa-agent.md`](qa-agent.md) | **QA Agent** | Owns verification. Backend HTTP tests first, then headed Playwright browser tests the user can watch. Writes live diary, routes bugs to right PM, iterates until everything passes. |
+| [`devops-agent.md`](devops-agent.md) | **DevOps Agent** | Owns deployment. Creates Dockerfiles, deploys to CapRover, wires Cloudflare tunnel config, creates DNS records, verifies end-to-end traffic chain. |
 
 ---
 
@@ -30,7 +31,13 @@ You
       │    ├── QA Phase 1: Backend HTTP tests (httpx, X-Request-ID proof, log verification)
       │    └── QA Phase 2: Frontend headed browser tests (Playwright MCP, you watch live)
       │         [Bug routing: Frontend PM or Backend PM, max 3 fix rounds]
-      └── Phase 4: Feature sign-off (health score ≥ 80, TESTING_MODE reset to FALSE)
+      ├── Phase 4: Feature sign-off (health score ≥ 80, TESTING_MODE reset to FALSE)
+      └── Phase 5: Activates DevOps Agent
+           ├── Create Dockerfiles (if not exist)
+           ├── Deploy backend + frontend to CapRover
+           ├── Add hostnames to /etc/cloudflared/config.yml + restart cloudflared
+           ├── Create Cloudflare DNS CNAME records via API
+           └── Verify full traffic chain: Browser → Cloudflare → tunnel → nginx → container
 ```
 
 ---
@@ -48,6 +55,9 @@ Every project built with this workflow uses:
 | API testing | `httpx` (Python) |
 | Design system | `DESIGN.md` (via gstack `/design-consultation`) |
 | Visual QA | gstack `/qa-only` (final sanity pass) |
+| Deployment | CapRover at `captain.crawlingrobo.com` |
+| Tunnel | Cloudflare Tunnel (`20a4ef64-b536-4021-ac2f-67eb9b17040a`) |
+| Domain | `crawlingrobo.com` |
 
 ---
 
@@ -76,6 +86,9 @@ Every project built with this workflow uses:
 - GitHub repo URL
 - Playwright MCP configured: `claude mcp add playwright -- npx @playwright/mcp@latest --headless false`
 - Power-admin email preference (default: `admin@[project].test`)
+- CapRover app names (backend + frontend) and internal container ports
+- CapRover password
+- Cloudflare API token + Zone ID for `crawlingrobo.com`
 
 ---
 
@@ -96,6 +109,10 @@ Every project built with this workflow uses:
 | `BACKEND_TEST_REPORT.md` | QA Agent | HTTP test proof with X-Request-ID per flow |
 | `QA_DIARY.md` | QA Agent | Live test diary with pass/fail per test case |
 | `QA_HANDOVER.md` | QA Agent | Final summary, health score, blocked items |
+| `Dockerfile` | DevOps Agent | Backend container definition |
+| `Dockerfile.frontend` | DevOps Agent | Frontend container definition |
+| `captain-definition` | DevOps Agent | CapRover build config (backend) |
+| `DEVOPS_HANDOVER.md` | DevOps Agent | Deployment summary, live URLs, DNS records created |
 
 ---
 
