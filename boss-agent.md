@@ -56,6 +56,62 @@ Escalation rule: if any sub-agent has attempted a task 3 times without success, 
 
 ---
 
+## MACHINE SETUP — Run once per machine (before any project work)
+
+Before touching any project config, the Boss Agent checks whether this machine is configured.
+
+### Step 1 — Check for machine-config.md
+
+Read `~/.claude/machine-config.md`.
+
+- If the file **does not exist**: tell the user to run the installer first:
+  ```bash
+  git clone https://github.com/leonatez/workflow-skills.git
+  cd workflow-skills
+  ./install.sh
+  ```
+  Then stop. Do not proceed until the file exists.
+
+- If the file **exists**: read it and check `DEPLOY_MODE`.
+
+### Step 2 — Validate DEPLOY_MODE
+
+**If `DEPLOY_MODE` is already set to `caprover-cloudflare` or `none`**: machine is configured. Skip to Phase 0.
+
+**If `DEPLOY_MODE` is missing or still has a placeholder value**: ask the user one question:
+
+> "Is this machine a deployment server (CapRover + Cloudflare Tunnel), or is it dev-only (local uvicorn + npm run dev, no Docker)?"
+
+- **Dev-only** → write `~/.claude/machine-config.md` with just:
+  ```
+  DEPLOY_MODE=none
+  NOTES=[ask user for a short description of the machine, e.g. "Home PC, dev only"]
+  ```
+  Done. Skip the remaining questions and proceed to Phase 0.
+
+- **CapRover + Cloudflare** → ask the following, one at a time, then write the full file:
+
+  1. CapRover dashboard URL (e.g. `https://captain.yourdomain.com`)
+  2. Cloudflare Tunnel ID — tell user to run `cloudflared tunnel list` if unsure
+  3. Root domain (e.g. `crawlingrobo.com`)
+  4. Path to cloudflared config file (default: `/etc/cloudflared/config.yml`)
+  5. Short description of this machine (for NOTES field)
+
+  Then write `~/.claude/machine-config.md`:
+  ```
+  DEPLOY_MODE=caprover-cloudflare
+  CAPROVER_URL=[answer 1]
+  TUNNEL_ID=[answer 2]
+  TUNNEL_CNAME_TARGET=[answer 2].cfargotunnel.com
+  CLOUDFLARE_CONFIG_FILE=[answer 4]
+  DOMAIN=[answer 3]
+  NOTES=[answer 5]
+  ```
+
+  Confirm back to the user: "Machine config saved. DevOps Agent will use these values for all projects on this machine."
+
+---
+
 ## PHASE 0 — Project Prerequisites (run once per project)
 
 Before any feature work begins, the Boss Agent must collect all prerequisites. Do this interactively — one question at a time. Do not dump a form at the user.
