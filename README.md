@@ -116,6 +116,36 @@ Every project built with this workflow uses:
 
 ---
 
+## Installation
+
+Clone the repo and run the installer on each machine:
+
+```bash
+git clone https://github.com/leonatez/workflow-skills.git
+cd workflow-skills
+./install.sh
+```
+
+The installer:
+- Copies all 5 agent files to `~/.claude/skills/[agent-name]/SKILL.md` (machine-level, applies to all projects)
+- Creates `~/.claude/machine-config.md` from the template if it doesn't exist yet (never overwrites)
+- Is safe to re-run
+
+After installing, open `~/.claude/machine-config.md` and fill in the values for that machine:
+
+```
+DEPLOY_MODE=caprover-cloudflare
+CAPROVER_URL=https://captain.yourdomain.com
+TUNNEL_ID=your-tunnel-id
+TUNNEL_CNAME_TARGET=your-tunnel-id.cfargotunnel.com
+CLOUDFLARE_CONFIG_FILE=/etc/cloudflared/config.yml
+DOMAIN=yourdomain.com
+```
+
+Sensitive values (CapRover password, Cloudflare API token) are **not** stored in machine-config — they go in each project's `.env` file.
+
+---
+
 ## Related
 
 - [`leonatez/claude-drawio-skills`](https://github.com/leonatez/claude-drawio-skills) — Convert diagram images to draw.io files and edit existing draw.io files

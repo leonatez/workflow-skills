@@ -2,69 +2,69 @@
 
 ## Role
 
-The DevOps Agent owns deployment. It takes a QA-verified, signed-off feature and makes it live on production infrastructure: CapRover on the MiniPC, served publicly via Cloudflare Tunnel. It creates Dockerfiles if they don't exist, deploys both frontend and backend apps to CapRover, wires up the Cloudflare tunnel config, creates the DNS records, and verifies the full traffic chain end to end.
+The DevOps Agent owns deployment. It takes a QA-verified, signed-off feature and makes it live on production infrastructure. It creates Dockerfiles if they don't exist, deploys both frontend and backend apps to CapRover, wires up the Cloudflare tunnel config, creates DNS records, and verifies the full traffic chain end to end.
 
 **The DevOps Agent never interacts directly with the user.** All communication goes through the Boss Agent.
 
 ---
 
-## Infrastructure (fixed — do not change without Boss Agent instruction)
+## Step 0 — Read machine config
 
-| Component | Value |
-|-----------|-------|
-| CapRover dashboard | https://captain.crawlingrobo.com |
-| Tunnel ID | `20a4ef64-b536-4021-ac2f-67eb9b17040a` |
-| Tunnel CNAME target | `20a4ef64-b536-4021-ac2f-67eb9b17040a.cfargotunnel.com` |
-| Tunnel config file | `/etc/cloudflared/config.yml` |
-| Cloudflare traffic → | `localhost:80` (always — CapRover nginx routes internally) |
-| Domain | `crawlingrobo.com` |
-| Internal Docker network | `captain-overlay-network` |
-| Container naming pattern | `srv-captain--[app-name]` |
-
-**Critical rule:** Never point cloudflared directly at the app's container port (e.g. `localhost:8000`). Always use `localhost:80`. CapRover's nginx container handles host-header-based routing to the correct app container internally.
-
----
-
-## Inputs (received from Boss Agent)
-
-All values come from `PROJECT_CONFIG.md` and `.env`:
-
-- Backend CapRover app name (e.g. `myproject-api`)
-- Frontend CapRover app name (e.g. `myproject`)
-- Backend internal container port (e.g. `8000`)
-- Frontend internal container port (e.g. `3000`)
-- CapRover password (from `.env` as `CAPROVER_PASSWORD`)
-- Cloudflare API token (from `.env` as `CLOUDFLARE_API_TOKEN`)
-- Cloudflare Zone ID (from `.env` as `CLOUDFLARE_ZONE_ID`)
-
----
-
-## Step 0 — Read credentials from .env
+**Before doing anything else**, read `~/.claude/machine-config.md`:
 
 ```bash
-export CAPROVER_PASSWORD=$(grep CAPROVER_PASSWORD .env | cut -d '=' -f2)
-export CLOUDFLARE_API_TOKEN=$(grep CLOUDFLARE_API_TOKEN .env | cut -d '=' -f2)
-export CLOUDFLARE_ZONE_ID=$(grep CLOUDFLARE_ZONE_ID .env | cut -d '=' -f2)
-export CAPROVER_URL="https://captain.crawlingrobo.com"
+cat ~/.claude/machine-config.md
 ```
 
-If any variable is empty: stop and report `NEEDS_CONTEXT` to Boss Agent — list exactly which variables are missing from `.env`.
+If the file does not exist: stop immediately. Report to Boss Agent:
+```
+BLOCKED: ~/.claude/machine-config.md not found on this machine.
+The user must run the workflow-skills install script first:
+  bash /path/to/workflow-skills/install.sh
+Then fill in ~/.claude/machine-config.md with this machine's infrastructure values.
+```
+
+Extract and hold these values for use throughout this skill:
+- `DEPLOY_MODE` — if not `caprover-cloudflare`, stop and report to Boss Agent that this machine's deploy mode is not supported by this agent
+- `CAPROVER_URL` — the CapRover dashboard URL
+- `TUNNEL_ID` — Cloudflare tunnel ID
+- `TUNNEL_CNAME_TARGET` — `TUNNEL_ID.cfargotunnel.com`
+- `CLOUDFLARE_CONFIG_FILE` — path to cloudflared config (usually `/etc/cloudflared/config.yml`)
+- `DOMAIN` — root domain (e.g. `crawlingrobo.com`)
 
 ---
 
-## Step 1 — Dockerfiles
-
-### 1.1 — Check for existing Dockerfiles
+## Step 1 — Read project credentials from .env
 
 ```bash
-ls Dockerfile Dockerfile.frontend docker-compose.yml 2>/dev/null
+export CAPROVER_PASSWORD=$(grep ^CAPROVER_PASSWORD .env | cut -d '=' -f2-)
+export CLOUDFLARE_API_TOKEN=$(grep ^CLOUDFLARE_API_TOKEN .env | cut -d '=' -f2-)
+export CLOUDFLARE_ZONE_ID=$(grep ^CLOUDFLARE_ZONE_ID .env | cut -d '=' -f2-)
 ```
 
-If both backend and frontend Dockerfiles exist: skip to Step 2.
+If any variable is empty: stop. Report `NEEDS_CONTEXT` to Boss Agent — list exactly which `.env` variables are missing.
 
-### 1.2 — Backend Dockerfile (FastAPI)
+Also read from `PROJECT_CONFIG.md`:
+- Backend CapRover app name
+- Frontend CapRover app name
+- Backend internal container port
+- Frontend internal container port
 
-If `Dockerfile` does not exist at project root, create it:
+---
+
+## Step 2 — Dockerfiles
+
+### 2.1 — Check for existing Dockerfiles
+
+```bash
+ls Dockerfile Dockerfile.frontend captain-definition 2>/dev/null
+```
+
+If all exist: skip to Step 3.
+
+### 2.2 — Backend Dockerfile (FastAPI)
+
+If `Dockerfile` does not exist, create it:
 
 ```dockerfile
 FROM python:3.12-slim
@@ -76,29 +76,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Expose the internal port (must match CapRover HTTP Settings)
 EXPOSE [BACKEND_INTERNAL_PORT]
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "[BACKEND_INTERNAL_PORT]"]
 ```
 
-Replace `[BACKEND_INTERNAL_PORT]` with the actual port from `PROJECT_CONFIG.md`.
+**Never bake secrets into the image.** All env vars (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `TESTING_MODE`, etc.) are injected via CapRover app config at deploy time.
 
-**Production environment variables to set in CapRover app config (not baked into image):**
-- `ENVIRONMENT=production`
-- `TESTING_MODE=FALSE`
-- `SUPABASE_URL`
-- `SUPABASE_ANON_KEY`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `LOG_LEVEL=INFO`
-- `LOG_FILE=logs/app.log`
+### 2.3 — Frontend Dockerfile
 
-### 1.3 — Frontend Dockerfile
-
-If a frontend Dockerfile does not exist, create `Dockerfile.frontend`. The template depends on the frontend framework — detect it first:
+Detect framework first:
 
 ```bash
-# Detect framework
 [ -f "package.json" ] && grep -q '"next"' package.json && echo "FRAMEWORK:nextjs"
 [ -f "package.json" ] && grep -q '"vite"' package.json && echo "FRAMEWORK:vite"
 [ -f "package.json" ] && grep -q '"react-scripts"' package.json && echo "FRAMEWORK:cra"
@@ -151,11 +140,7 @@ server {
 }
 ```
 
-Replace `[FRONTEND_INTERNAL_PORT]` with actual port.
-
-### 1.4 — captain-definition files
-
-CapRover uses `captain-definition` to know which Dockerfile to build. Create one per app:
+### 2.4 — captain-definition files
 
 **Backend (`captain-definition`):**
 ```json
@@ -175,9 +160,7 @@ CapRover uses `captain-definition` to know which Dockerfile to build. Create one
 
 ---
 
-## Step 2 — Authenticate with CapRover API
-
-Get an auth token:
+## Step 3 — Authenticate with CapRover API
 
 ```bash
 CAPROVER_TOKEN=$(curl -s -X POST "$CAPROVER_URL/api/v2/login" \
@@ -188,25 +171,23 @@ CAPROVER_TOKEN=$(curl -s -X POST "$CAPROVER_URL/api/v2/login" \
 echo "CapRover token: ${CAPROVER_TOKEN:0:20}..."
 ```
 
-If token is empty or the request fails: stop. Report `BLOCKED` to Boss Agent — CapRover authentication failed. Check that `CAPROVER_PASSWORD` in `.env` is correct.
+If the token is empty: stop. Report `BLOCKED` — CapRover authentication failed. Check `CAPROVER_PASSWORD` in `.env` and confirm `CAPROVER_URL` in `~/.claude/machine-config.md` is correct.
 
 ---
 
-## Step 3 — Create apps in CapRover
+## Step 4 — Create apps in CapRover
 
-For each app (backend, frontend), check if it already exists, then create if not.
+For each app (backend, frontend):
 
-### 3.1 — Check if app exists
+### 4.1 — Check if app exists
 
 ```bash
-APPS=$(curl -s "$CAPROVER_URL/api/v2/user/apps/appDefinitions" \
+curl -s "$CAPROVER_URL/api/v2/user/apps/appDefinitions" \
   -H "x-captain-auth: $CAPROVER_TOKEN" \
-  | python3 -c "import sys,json; [print(a['appName']) for a in json.load(sys.stdin)['data']['appDefinitions']]")
-
-echo "$APPS" | grep -q "[APP_NAME]" && echo "EXISTS" || echo "NOT_FOUND"
+  | python3 -c "import sys,json; names=[a['appName'] for a in json.load(sys.stdin)['data']['appDefinitions']]; print('EXISTS' if '[APP_NAME]' in names else 'NOT_FOUND')"
 ```
 
-### 3.2 — Create app (if not found)
+### 4.2 — Create if not found
 
 ```bash
 curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/register" \
@@ -215,11 +196,7 @@ curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/register" \
   -d "{\"appName\": \"[APP_NAME]\", \"hasPersistentData\": false}"
 ```
 
-Do this for both backend and frontend app names.
-
-### 3.3 — Set HTTP port in CapRover
-
-CapRover needs to know which port the container listens on so nginx can route to it:
+### 4.3 — Set HTTP port
 
 ```bash
 curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
@@ -233,13 +210,15 @@ curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
   }"
 ```
 
-Run this for:
-- Backend: `appName=[backend-app-name]`, `containerHttpPort=[backend-internal-port]`
-- Frontend: `appName=[frontend-app-name]`, `containerHttpPort=[frontend-internal-port]`
+### 4.4 — Set production environment variables (backend only)
 
-### 3.4 — Set environment variables in CapRover (backend only)
+Read Supabase values from the project's `.env`:
 
 ```bash
+SUPABASE_URL=$(grep ^SUPABASE_URL .env | cut -d '=' -f2-)
+SUPABASE_ANON_KEY=$(grep ^SUPABASE_ANON_KEY .env | cut -d '=' -f2-)
+SUPABASE_SERVICE_ROLE_KEY=$(grep ^SUPABASE_SERVICE_ROLE_KEY .env | cut -d '=' -f2-)
+
 curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
   -H "x-captain-auth: $CAPROVER_TOKEN" \
   -H "Content-Type: application/json" \
@@ -248,36 +227,31 @@ curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
     \"envVars\": [
       {\"key\": \"ENVIRONMENT\", \"value\": \"production\"},
       {\"key\": \"TESTING_MODE\", \"value\": \"FALSE\"},
-      {\"key\": \"SUPABASE_URL\", \"value\": \"[value]\"},
-      {\"key\": \"SUPABASE_ANON_KEY\", \"value\": \"[value]\"},
-      {\"key\": \"SUPABASE_SERVICE_ROLE_KEY\", \"value\": \"[value]\"},
+      {\"key\": \"SUPABASE_URL\", \"value\": \"$SUPABASE_URL\"},
+      {\"key\": \"SUPABASE_ANON_KEY\", \"value\": \"$SUPABASE_ANON_KEY\"},
+      {\"key\": \"SUPABASE_SERVICE_ROLE_KEY\", \"value\": \"$SUPABASE_SERVICE_ROLE_KEY\"},
       {\"key\": \"LOG_LEVEL\", \"value\": \"INFO\"}
     ]
   }"
 ```
 
-Read Supabase values from the local `.env` file — do not hardcode them.
-
 ---
 
-## Step 4 — Deploy to CapRover
-
-Use `caprover deploy` CLI if installed, otherwise use tarball upload via API.
+## Step 5 — Deploy to CapRover
 
 ### Option A — caprover CLI (preferred)
 
 ```bash
-# Check if caprover CLI is installed
 caprover --version 2>/dev/null || npm install -g caprover
 
-# Deploy backend
+# Backend
 caprover deploy \
   --host "$CAPROVER_URL" \
   --appToken "$CAPROVER_TOKEN" \
   --appName "[BACKEND_APP_NAME]" \
   --branch main
 
-# Deploy frontend
+# Frontend
 caprover deploy \
   --host "$CAPROVER_URL" \
   --appToken "$CAPROVER_TOKEN" \
@@ -288,7 +262,6 @@ caprover deploy \
 ### Option B — Tarball upload (fallback)
 
 ```bash
-# Create tarball of the project
 tar -czf /tmp/deploy.tar.gz \
   --exclude='.git' \
   --exclude='node_modules' \
@@ -297,107 +270,95 @@ tar -czf /tmp/deploy.tar.gz \
   --exclude='logs' \
   .
 
-# Upload to CapRover
 curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/webhooks/triggerbuild" \
   -H "x-captain-auth: $CAPROVER_TOKEN" \
   -F "sourceFile=@/tmp/deploy.tar.gz" \
   -F "appName=[APP_NAME]"
 ```
 
-### 4.1 — Wait for build to complete
-
-After triggering a deploy, poll the build log until complete:
+### 5.1 — Wait for build
 
 ```bash
 for i in $(seq 1 30); do
   STATUS=$(curl -s "$CAPROVER_URL/api/v2/user/apps/appData/[APP_NAME]" \
     -H "x-captain-auth: $CAPROVER_TOKEN" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print(d.get('isAppBuilding', True))")
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['data'].get('isAppBuilding', True))")
   echo "Building: $STATUS"
   [ "$STATUS" = "False" ] && echo "BUILD COMPLETE" && break
   sleep 10
 done
 ```
 
-If build does not complete after 5 minutes: report `BLOCKED` to Boss Agent with the build log URL (`$CAPROVER_URL/apps/details/[APP_NAME]`).
+If build does not complete after 5 minutes: report `BLOCKED` to Boss Agent with the CapRover app URL for manual log inspection: `$CAPROVER_URL/apps/details/[APP_NAME]`.
 
 ---
 
-## Step 5 — Cloudflare Tunnel Config
+## Step 6 — Cloudflare Tunnel Config
 
-Edit `/etc/cloudflared/config.yml` to add hostname entries for both apps.
+Use `CLOUDFLARE_CONFIG_FILE` from `~/.claude/machine-config.md` (not hardcoded).
 
-### 5.1 — Read current config
-
-```bash
-sudo cat /etc/cloudflared/config.yml
-```
-
-### 5.2 — Check for existing entries
+### 6.1 — Read current config
 
 ```bash
-sudo grep "[BACKEND_APP_NAME].crawlingrobo.com" /etc/cloudflared/config.yml && echo "EXISTS" || echo "MISSING"
-sudo grep "[FRONTEND_APP_NAME].crawlingrobo.com" /etc/cloudflared/config.yml && echo "EXISTS" || echo "MISSING"
+sudo cat "$CLOUDFLARE_CONFIG_FILE"
 ```
 
-### 5.3 — Add missing entries
-
-Add new ingress rules **before the catch-all line** (`- service: http_status:404`).
-
-The rule to add for each app:
-```yaml
-  - hostname: [APP_NAME].crawlingrobo.com
-    service: http://localhost:80
-```
-
-**Always use `http://localhost:80`** — never the app's internal port. CapRover nginx routes by Host header internally.
-
-Use Python to safely insert before the catch-all (avoids sed edge cases):
+### 6.2 — Check for existing entries
 
 ```bash
-sudo python3 - <<'EOF'
-import re
+sudo grep "[BACKEND_APP_NAME].$DOMAIN" "$CLOUDFLARE_CONFIG_FILE" && echo "EXISTS" || echo "MISSING"
+sudo grep "[FRONTEND_APP_NAME].$DOMAIN" "$CLOUDFLARE_CONFIG_FILE" && echo "EXISTS" || echo "MISSING"
+```
 
-with open('/etc/cloudflared/config.yml', 'r') as f:
-    content = f.read()
+### 6.3 — Add missing entries
 
-entries_to_add = [
-    "  - hostname: [BACKEND_APP_NAME].crawlingrobo.com\n    service: http://localhost:80",
-    "  - hostname: [FRONTEND_APP_NAME].crawlingrobo.com\n    service: http://localhost:80",
+Always use `http://localhost:80` — never the app's direct container port.
+CapRover's nginx routes by Host header internally to the correct container.
+
+```bash
+sudo python3 - <<EOF
+config_file = "$CLOUDFLARE_CONFIG_FILE"
+domain = "$DOMAIN"
+apps = [
+    "[BACKEND_APP_NAME]",
+    "[FRONTEND_APP_NAME]",
 ]
 
-for entry in entries_to_add:
-    hostname = entry.split('hostname: ')[1].split('\n')[0]
+with open(config_file, 'r') as f:
+    content = f.read()
+
+for app in apps:
+    hostname = f"{app}.{domain}"
     if hostname in content:
         print(f"SKIP (already exists): {hostname}")
         continue
-    # Insert before catch-all
+    entry = f"  - hostname: {hostname}\n    service: http://localhost:80"
     content = content.replace(
         '  - service: http_status:404',
         f'{entry}\n  - service: http_status:404'
     )
     print(f"ADDED: {hostname}")
 
-with open('/etc/cloudflared/config.yml', 'w') as f:
+with open(config_file, 'w') as f:
     f.write(content)
 
 print("Done.")
 EOF
 ```
 
-### 5.4 — Verify the config looks correct
+### 6.4 — Verify config
 
 ```bash
-sudo cat /etc/cloudflared/config.yml
+sudo cat "$CLOUDFLARE_CONFIG_FILE"
 ```
 
 Confirm:
 - Both new hostname entries appear before `- service: http_status:404`
 - No duplicate entries
-- `captain.crawlingrobo.com` still points to `http://localhost:3000` (CapRover dashboard exception — do not touch)
+- CapRover dashboard entry (`captain.$DOMAIN`) is untouched
 - Catch-all is still last
 
-### 5.5 — Restart cloudflared
+### 6.5 — Restart cloudflared
 
 ```bash
 sudo systemctl restart cloudflared
@@ -405,24 +366,27 @@ sleep 3
 sudo systemctl status cloudflared | grep -E "Active|running|failed"
 ```
 
-If status shows `failed`: run `sudo journalctl -u cloudflared -n 50` and report the error to Boss Agent as `BLOCKED`.
+If status shows `failed`:
+```bash
+sudo journalctl -u cloudflared -n 50
+```
+Report full output to Boss Agent as `BLOCKED`.
 
 ---
 
-## Step 6 — Cloudflare DNS Records
+## Step 7 — Cloudflare DNS Records
 
-Create CNAME records for both apps via Cloudflare API.
+Use `TUNNEL_CNAME_TARGET` and `CLOUDFLARE_ZONE_ID` (from `.env`).
 
-### 6.1 — Check if record already exists
+### 7.1 — Check if record exists
 
 ```bash
-curl -s "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=CNAME&name=[APP_NAME].crawlingrobo.com" \
+curl -s "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=CNAME&name=[APP_NAME].$DOMAIN" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  -H "Content-Type: application/json" \
   | python3 -c "import sys,json; r=json.load(sys.stdin); print('EXISTS' if r['result'] else 'MISSING')"
 ```
 
-### 6.2 — Create CNAME record (if missing)
+### 7.2 — Create CNAME (if missing)
 
 ```bash
 curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
@@ -431,7 +395,7 @@ curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/
   -d "{
     \"type\": \"CNAME\",
     \"name\": \"[APP_NAME]\",
-    \"content\": \"20a4ef64-b536-4021-ac2f-67eb9b17040a.cfargotunnel.com\",
+    \"content\": \"$TUNNEL_CNAME_TARGET\",
     \"proxied\": true,
     \"comment\": \"[PROJECT_NAME] - created by DevOps Agent\"
   }" \
@@ -442,107 +406,103 @@ Do this for both backend and frontend app names.
 
 ---
 
-## Step 7 — End-to-End Verification
+## Step 8 — End-to-End Verification
 
-### 7.1 — Wait for DNS propagation
-
-DNS changes via Cloudflare proxy are usually live within 30–60 seconds. Wait 60 seconds after creating records:
+### 8.1 — Wait for DNS propagation
 
 ```bash
 echo "Waiting 60s for DNS propagation..."
 sleep 60
 ```
 
-### 7.2 — Test the traffic chain
-
-For each deployed URL:
+### 8.2 — Test traffic chain
 
 ```bash
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://[APP_NAME].crawlingrobo.com)
-echo "HTTP status: $HTTP_CODE"
+for url in "https://[BACKEND_APP_NAME].$DOMAIN" "https://[FRONTEND_APP_NAME].$DOMAIN"; do
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" "$url")
+  echo "$url → HTTP $CODE"
+done
 ```
 
 **Interpret results:**
 
 | Code | Meaning | Action |
 |------|---------|--------|
-| 200–299 | Working correctly | ✅ Pass |
-| 301–302 | Redirect (likely HTTP→HTTPS) | ✅ Pass — follow and recheck |
-| 404 from app | App is live, route not found | ✅ Chain works — app-level issue |
-| 404 from nginx HTML page | CapRover nginx has no app matching hostname | ❌ Check CapRover app name matches subdomain exactly |
-| 502 / 503 | App container crashed or not running | ❌ Check CapRover build log |
-| 000 | DNS not resolving | ❌ CNAME missing or not propagated yet — wait 2 min and retry |
-| Connection refused | cloudflared not running or wrong port in config | ❌ Check systemctl status cloudflared |
+| 200–299 | Working | ✅ Pass |
+| 301–302 | Redirect (HTTP→HTTPS) | ✅ Pass — follow and recheck |
+| 404 from app | App live, route not found | ✅ Chain works — app-level issue |
+| 404 from nginx HTML | CapRover has no app matching hostname | ❌ App name mismatch — check CapRover |
+| 502 / 503 | Container crashed or not running | ❌ Check CapRover build log |
+| 000 | DNS not resolving | ❌ CNAME missing or not propagated — wait 2 min and retry |
 
-### 7.3 — Backend health check
+### 8.3 — Backend health check
 
 ```bash
-curl -s https://[BACKEND_APP_NAME].crawlingrobo.com/health
+curl -s "https://[BACKEND_APP_NAME].$DOMAIN/health"
 ```
 
-If the FastAPI app has a `/health` endpoint, it should return `{"status": "ok"}`. Confirm ENVIRONMENT=production and TESTING_MODE=FALSE are reflected in the response (or check via a `/config` debug endpoint if one exists).
+### 8.4 — Confirm TESTING_MODE=FALSE in production
 
-### 7.4 — Confirm TESTING_MODE is FALSE in production
+Check the startup log in CapRover at: `$CAPROVER_URL/apps/details/[BACKEND_APP_NAME]`
 
-The Backend PM's startup guard should reject `TESTING_MODE=TRUE` in production. Confirm by checking the startup log in CapRover:
-
-CapRover app logs are visible at: `$CAPROVER_URL/apps/details/[BACKEND_APP_NAME]`
-
-Look for: `"TESTING_MODE: FALSE"` and `"ENVIRONMENT: production"` in the startup log output.
+Look for: `"TESTING_MODE: FALSE"` and `"ENVIRONMENT: production"` in startup output.
 
 ---
 
-## Step 8 — Handover to Boss Agent
+## Step 9 — Handover to Boss Agent
 
 ```markdown
 # DevOps Handover
 
 ## Deployment: [Feature / Project Name]
 ## Date: [date]
+## Machine: [CAPROVER_URL from machine-config]
 ## Status: ✅ LIVE | ❌ BLOCKED
 
 ## URLs deployed
 | App | URL | HTTP status | Chain verified |
 |-----|-----|-------------|----------------|
-| Backend | https://[backend-name].crawlingrobo.com | [code] | ✅ / ❌ |
-| Frontend | https://[frontend-name].crawlingrobo.com | [code] | ✅ / ❌ |
+| Backend | https://[backend-name].[DOMAIN] | [code] | ✅ / ❌ |
+| Frontend | https://[frontend-name].[DOMAIN] | [code] | ✅ / ❌ |
 
-## CapRover apps
-| App | Internal port | Environment vars set | Build status |
-|-----|---------------|---------------------|--------------|
-| [backend-name] | [port] | ✅ | DEPLOYED |
-| [frontend-name] | [port] | N/A | DEPLOYED |
+## CapRover
+| App | Port | Env vars set | Build |
+|-----|------|-------------|-------|
+| [backend] | [port] | ✅ | DEPLOYED |
+| [frontend] | [port] | N/A | DEPLOYED |
 
 ## Cloudflare tunnel
-- Config file updated: ✅
+- Config file: [CLOUDFLARE_CONFIG_FILE]
+- Entries added: ✅
 - cloudflared restarted: ✅
 - cloudflared status: active (running)
 
 ## DNS records
-| Hostname | Type | Target | Proxied | Status |
-|----------|------|--------|---------|--------|
-| [backend-name].crawlingrobo.com | CNAME | 20a4ef64...cfargotunnel.com | ✅ | created |
-| [frontend-name].crawlingrobo.com | CNAME | 20a4ef64...cfargotunnel.com | ✅ | created |
+| Hostname | CNAME target | Proxied | Status |
+|----------|-------------|---------|--------|
+| [backend].[DOMAIN] | [TUNNEL_CNAME_TARGET] | ✅ | created |
+| [frontend].[DOMAIN] | [TUNNEL_CNAME_TARGET] | ✅ | created |
 
 ## Verification
-- Backend health check: [response]
+- Backend health: [response]
 - TESTING_MODE in production: FALSE ✅
-- ENVIRONMENT in production: production ✅
+- ENVIRONMENT: production ✅
 
-## Blocked items (if any)
-- [description] — [what user needs to do to unblock]
+## Blocked items
+- [description] → [what user must do]
 ```
 
 ---
 
 ## Common Mistakes — Never Do These
 
-| Mistake | Result | Correct approach |
-|---------|--------|-----------------|
-| Point cloudflared to app port (e.g. `localhost:8000`) | Connection refused — port not bound to host | Always use `localhost:80` |
-| Edit `~/.cloudflared/config.yml` | Changes ignored — service reads `/etc/cloudflared/` | Always edit `/etc/cloudflared/config.yml` |
-| Duplicate hostname in config | Second entry silently ignored | Check before inserting — grep first |
-| Missing DNS CNAME | `curl` returns `000` | Create CNAME via Cloudflare API |
-| Deploy without setting container HTTP port in CapRover | nginx doesn't know which port to forward to | Always call the update API to set `containerHttpPort` |
-| Bake `.env` values into Docker image | Secrets in image layers | Set env vars in CapRover app config, not Dockerfile |
-| Forget to restart cloudflared after config edit | New hostname not active | Always `sudo systemctl restart cloudflared` after editing config |
+| Mistake | Result | Fix |
+|---------|--------|-----|
+| Point cloudflared to app port (e.g. `localhost:8000`) | Connection refused | Always use `localhost:80` |
+| Edit `~/.cloudflared/config.yml` | Changes ignored | Always edit `CLOUDFLARE_CONFIG_FILE` from machine-config |
+| Duplicate hostname in config | Second entry silently ignored | Grep before inserting |
+| Missing DNS CNAME | `curl` returns `000` | Create via Cloudflare API |
+| Deploy without setting `containerHttpPort` | nginx can't route | Always call update API first |
+| Bake `.env` secrets into Docker image | Secrets in image layers | Set env vars in CapRover app config |
+| Forget to restart cloudflared after config edit | New hostname not active | Always `sudo systemctl restart cloudflared` |
+| Hardcode tunnel ID or domain | Breaks on other machines | Always read from `~/.claude/machine-config.md` |
