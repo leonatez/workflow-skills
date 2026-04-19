@@ -31,24 +31,30 @@ Extract and hold these values for use throughout this skill:
 - `TUNNEL_CNAME_TARGET` — `TUNNEL_ID.cfargotunnel.com`
 - `CLOUDFLARE_CONFIG_FILE` — path to cloudflared config (usually `/etc/cloudflared/config.yml`)
 - `DOMAIN` — root domain (e.g. `crawlingrobo.com`)
+- `CLOUDFLARE_API_TOKEN` — if present in machine-config, use it. Otherwise read from project `.env`.
+- `CLOUDFLARE_ZONE_ID` — same: prefer machine-config, fall back to `.env`.
 
 ---
 
-## Step 1 — Read project credentials from .env
+## Step 1 — Read project credentials
 
 ```bash
 export CAPROVER_PASSWORD=$(grep ^CAPROVER_PASSWORD .env | cut -d '=' -f2-)
-export CLOUDFLARE_API_TOKEN=$(grep ^CLOUDFLARE_API_TOKEN .env | cut -d '=' -f2-)
-export CLOUDFLARE_ZONE_ID=$(grep ^CLOUDFLARE_ZONE_ID .env | cut -d '=' -f2-)
+
+# Cloudflare — prefer machine-config values loaded in Step 0; fall back to .env
+export CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-$(grep ^CLOUDFLARE_API_TOKEN .env | cut -d '=' -f2-)}
+export CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID:-$(grep ^CLOUDFLARE_ZONE_ID .env | cut -d '=' -f2-)}
 ```
 
-If any variable is empty: stop. Report `NEEDS_CONTEXT` to Boss Agent — list exactly which `.env` variables are missing.
+If `CAPROVER_PASSWORD` is empty: stop. Report `NEEDS_CONTEXT` to Boss Agent.
+If `CLOUDFLARE_API_TOKEN` or `CLOUDFLARE_ZONE_ID` are still empty after both checks: report `NEEDS_CONTEXT`.
 
 Also read from `PROJECT_CONFIG.md`:
 - Backend CapRover app name
 - Frontend CapRover app name
 - Backend internal container port
 - Frontend internal container port
+- Whether the app needs persistent storage (e.g. local disk, uploads)
 
 ---
 
@@ -94,21 +100,79 @@ Detect framework first:
 ```
 
 **Next.js:**
+
+Before creating the Dockerfile, check `next.config.mjs` (or `next.config.js`) for `output: 'standalone'`. If it is missing, add it:
+
+```js
+const nextConfig = {
+  output: 'standalone',
+  // ... rest of config
+};
+```
+
+This is required — the Dockerfile copies from `.next/standalone` and will fail silently without it.
+
+Also check if the repo has a `public/` directory:
+
+```bash
+ls public/ 2>/dev/null || echo "NO_PUBLIC_DIR"
+```
+
+If `public/` does not exist, the `COPY --from=builder /app/public ./public` step will fail at build time. The Dockerfile below handles this by creating it before the build.
+
+Check `package.json` for `NEXT_PUBLIC_*` variables used in the codebase:
+
+```bash
+grep -r "NEXT_PUBLIC_" src/ --include="*.ts" --include="*.tsx" -l 2>/dev/null
+```
+
+If any `NEXT_PUBLIC_*` vars exist, they are baked into the client bundle at **build time** — they must be passed as Docker build args, not just runtime env vars.
+
 ```dockerfile
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm ci
+
 FROM node:20-alpine AS builder
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci
+COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN npm run build
+
+# Build-time vars — required for any NEXT_PUBLIC_ variables used in the app
+ARG NEXT_PUBLIC_SUPABASE_URL
+ARG NEXT_PUBLIC_SUPABASE_ANON_KEY
+ENV NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL
+ENV NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY
+# Add any other NEXT_PUBLIC_ vars here
+
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# Create public/ if not present in repo (COPY will fail if it doesn't exist)
+RUN mkdir -p /app/public && npm run build
 
 FROM node:20-alpine AS runner
 WORKDIR /app
+
 ENV NODE_ENV=production
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
+ENV NEXT_TELEMETRY_DISABLED=1
+
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs
+
 COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+# If the app uses local disk storage (e.g. data/), create and own the directory
+# RUN mkdir -p /app/data && chown -R nextjs:nodejs /app/data
+
+USER nextjs
+
 EXPOSE [FRONTEND_INTERNAL_PORT]
+ENV PORT=[FRONTEND_INTERNAL_PORT]
+ENV HOSTNAME="0.0.0.0"
+
 CMD ["node", "server.js"]
 ```
 
@@ -175,7 +239,7 @@ If the token is empty: stop. Report `BLOCKED` — CapRover authentication failed
 
 ---
 
-## Step 4 — Create apps in CapRover
+## Step 4 — Create and configure apps in CapRover
 
 For each app (backend, frontend):
 
@@ -189,6 +253,8 @@ curl -s "$CAPROVER_URL/api/v2/user/apps/appDefinitions" \
 
 ### 4.2 — Create if not found
 
+Set `hasPersistentData` to `true` if the app writes to local disk (uploads, project files, etc.).
+
 ```bash
 curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/register" \
   -H "x-captain-auth: $CAPROVER_TOKEN" \
@@ -196,7 +262,9 @@ curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/register" \
   -d "{\"appName\": \"[APP_NAME]\", \"hasPersistentData\": false}"
 ```
 
-### 4.3 — Set HTTP port
+### 4.3 — Set HTTP port, env vars, build args, and volumes
+
+Do this in a single update call per app. For Next.js apps with `NEXT_PUBLIC_*` variables, include `buildArgs` so they are passed to `docker build --build-arg`.
 
 ```bash
 curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
@@ -204,21 +272,39 @@ curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
   -H "Content-Type: application/json" \
   -d "{
     \"appName\": \"[APP_NAME]\",
+    \"instanceCount\": 1,
     \"containerHttpPort\": [INTERNAL_PORT],
     \"notExposeAsWebApp\": false,
-    \"forceSsl\": false
+    \"forceSsl\": false,
+    \"hasPersistentData\": false,
+    \"envVars\": [
+      {\"key\": \"NODE_ENV\", \"value\": \"production\"},
+      {\"key\": \"NEXT_PUBLIC_SUPABASE_URL\", \"value\": \"$SUPABASE_URL\"},
+      {\"key\": \"NEXT_PUBLIC_SUPABASE_ANON_KEY\", \"value\": \"$SUPABASE_ANON_KEY\"},
+      {\"key\": \"SUPABASE_SERVICE_ROLE_KEY\", \"value\": \"$SUPABASE_SERVICE_ROLE_KEY\"},
+      {\"key\": \"GEMINI_API_KEY\", \"value\": \"$GEMINI_API_KEY\"}
+    ],
+    \"buildArgs\": [
+      {\"key\": \"NEXT_PUBLIC_SUPABASE_URL\", \"value\": \"$SUPABASE_URL\"},
+      {\"key\": \"NEXT_PUBLIC_SUPABASE_ANON_KEY\", \"value\": \"$SUPABASE_ANON_KEY\"}
+    ]
   }"
 ```
 
-### 4.4 — Set production environment variables (backend only)
+If the app uses local disk storage, also include `volumes`:
 
-Read Supabase values from the project's `.env`:
+```json
+"volumes": [
+  {
+    "containerPath": "/app/data",
+    "volumeName": "[APP_NAME]-data"
+  }
+]
+```
+
+### 4.4 — Backend-specific env vars (FastAPI)
 
 ```bash
-SUPABASE_URL=$(grep ^SUPABASE_URL .env | cut -d '=' -f2-)
-SUPABASE_ANON_KEY=$(grep ^SUPABASE_ANON_KEY .env | cut -d '=' -f2-)
-SUPABASE_SERVICE_ROLE_KEY=$(grep ^SUPABASE_SERVICE_ROLE_KEY .env | cut -d '=' -f2-)
-
 curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
   -H "x-captain-auth: $CAPROVER_TOKEN" \
   -H "Content-Type: application/json" \
@@ -239,27 +325,7 @@ curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
 
 ## Step 5 — Deploy to CapRover
 
-### Option A — caprover CLI (preferred)
-
-```bash
-caprover --version 2>/dev/null || npm install -g caprover
-
-# Backend
-caprover deploy \
-  --host "$CAPROVER_URL" \
-  --appToken "$CAPROVER_TOKEN" \
-  --appName "[BACKEND_APP_NAME]" \
-  --branch main
-
-# Frontend
-caprover deploy \
-  --host "$CAPROVER_URL" \
-  --appToken "$CAPROVER_TOKEN" \
-  --appName "[FRONTEND_APP_NAME]" \
-  --branch main
-```
-
-### Option B — Tarball upload (fallback)
+### Option A — Tarball upload (preferred — works without interactive login)
 
 ```bash
 tar -czf /tmp/deploy.tar.gz \
@@ -267,27 +333,47 @@ tar -czf /tmp/deploy.tar.gz \
   --exclude='node_modules' \
   --exclude='__pycache__' \
   --exclude='.env' \
+  --exclude='data' \
+  --exclude='.next' \
   --exclude='logs' \
   .
 
-curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/webhooks/triggerbuild" \
+curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appData/[APP_NAME]" \
   -H "x-captain-auth: $CAPROVER_TOKEN" \
-  -F "sourceFile=@/tmp/deploy.tar.gz" \
-  -F "appName=[APP_NAME]"
+  -F "sourceFile=@/tmp/deploy.tar.gz"
 ```
 
-### 5.1 — Wait for build
+**Note:** The app name goes in the URL path, not as a form field. The correct endpoint is `/api/v2/user/apps/appData/[APP_NAME]`.
+
+### Option B — caprover CLI (requires interactive login session)
 
 ```bash
-for i in $(seq 1 30); do
-  STATUS=$(curl -s "$CAPROVER_URL/api/v2/user/apps/appData/[APP_NAME]" \
-    -H "x-captain-auth: $CAPROVER_TOKEN" \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['data'].get('isAppBuilding', True))")
-  echo "Building: $STATUS"
-  [ "$STATUS" = "False" ] && echo "BUILD COMPLETE" && break
-  sleep 10
-done
+caprover --version 2>/dev/null || npm install -g caprover
+
+caprover deploy \
+  --host "$CAPROVER_URL" \
+  --appToken "$CAPROVER_TOKEN" \
+  --appName "[APP_NAME]" \
+  --branch main
 ```
+
+### 5.1 — Wait for build to complete
+
+```bash
+until [ "$(curl -s "$CAPROVER_URL/api/v2/user/apps/appData/[APP_NAME]" \
+  -H "x-captain-auth: $CAPROVER_TOKEN" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['isAppBuilding'])")" = "False" ]; do
+  sleep 5
+done
+
+curl -s "$CAPROVER_URL/api/v2/user/apps/appData/[APP_NAME]" \
+  -H "x-captain-auth: $CAPROVER_TOKEN" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('Failed:', d['data']['isBuildFailed']); [print(l, end='') for l in d['data']['logs']['lines'][-30:]]"
+```
+
+If `isBuildFailed` is `True`: read the full log output and diagnose before retrying. Common Next.js failures:
+- `COPY failed: stat app/public: file does not exist` → repo has no `public/` dir; add `mkdir -p /app/public` before `npm run build` in the builder stage
+- `output: 'standalone'` missing → add it to `next.config.mjs` and redeploy
 
 If build does not complete after 5 minutes: report `BLOCKED` to Boss Agent with the CapRover app URL for manual log inspection: `$CAPROVER_URL/apps/details/[APP_NAME]`.
 
@@ -306,8 +392,7 @@ sudo cat "$CLOUDFLARE_CONFIG_FILE"
 ### 6.2 — Check for existing entries
 
 ```bash
-sudo grep "[BACKEND_APP_NAME].$DOMAIN" "$CLOUDFLARE_CONFIG_FILE" && echo "EXISTS" || echo "MISSING"
-sudo grep "[FRONTEND_APP_NAME].$DOMAIN" "$CLOUDFLARE_CONFIG_FILE" && echo "EXISTS" || echo "MISSING"
+sudo grep "[APP_NAME].$DOMAIN" "$CLOUDFLARE_CONFIG_FILE" && echo "EXISTS" || echo "MISSING"
 ```
 
 ### 6.3 — Add missing entries
@@ -335,7 +420,7 @@ for app in apps:
     entry = f"  - hostname: {hostname}\n    service: http://localhost:80"
     content = content.replace(
         '  - service: http_status:404',
-        f'{entry}\n  - service: http_status:404'
+        f'{entry}\n\n  - service: http_status:404'
     )
     print(f"ADDED: {hostname}")
 
@@ -346,6 +431,19 @@ print("Done.")
 EOF
 ```
 
+**Note:** The DevOps Agent cannot write to `/etc/cloudflared/config.yml` directly — it requires sudo. If sudo is not available non-interactively, report to Boss Agent with the exact command for the user to run:
+
+```
+BLOCKED (tunnel config): sudo access required to edit /etc/cloudflared/config.yml.
+Ask the user to run:
+
+sudo python3 - <<'EOF'
+[paste the python script above with values substituted]
+EOF
+
+sudo systemctl restart cloudflared
+```
+
 ### 6.4 — Verify config
 
 ```bash
@@ -353,7 +451,7 @@ sudo cat "$CLOUDFLARE_CONFIG_FILE"
 ```
 
 Confirm:
-- Both new hostname entries appear before `- service: http_status:404`
+- New hostname entries appear before `- service: http_status:404`
 - No duplicate entries
 - CapRover dashboard entry (`captain.$DOMAIN`) is untouched
 - Catch-all is still last
@@ -376,7 +474,7 @@ Report full output to Boss Agent as `BLOCKED`.
 
 ## Step 7 — Cloudflare DNS Records
 
-Use `TUNNEL_CNAME_TARGET` and `CLOUDFLARE_ZONE_ID` (from `.env`).
+Use `TUNNEL_CNAME_TARGET` from machine-config and `CLOUDFLARE_ZONE_ID` + `CLOUDFLARE_API_TOKEN` (from machine-config or `.env`).
 
 ### 7.1 — Check if record exists
 
@@ -397,6 +495,7 @@ curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/
     \"name\": \"[APP_NAME]\",
     \"content\": \"$TUNNEL_CNAME_TARGET\",
     \"proxied\": true,
+    \"ttl\": 1,
     \"comment\": \"[PROJECT_NAME] - created by DevOps Agent\"
   }" \
   | python3 -c "import sys,json; r=json.load(sys.stdin); print('CREATED' if r['success'] else f'ERROR: {r[\"errors\"]}')"
@@ -466,10 +565,10 @@ Look for: `"TESTING_MODE: FALSE"` and `"ENVIRONMENT: production"` in startup out
 | Frontend | https://[frontend-name].[DOMAIN] | [code] | ✅ / ❌ |
 
 ## CapRover
-| App | Port | Env vars set | Build |
-|-----|------|-------------|-------|
-| [backend] | [port] | ✅ | DEPLOYED |
-| [frontend] | [port] | N/A | DEPLOYED |
+| App | Port | Env vars set | Build args set | Build |
+|-----|------|-------------|---------------|-------|
+| [backend] | [port] | ✅ | N/A | DEPLOYED |
+| [frontend] | [port] | ✅ | ✅ | DEPLOYED |
 
 ## Cloudflare tunnel
 - Config file: [CLOUDFLARE_CONFIG_FILE]
@@ -502,7 +601,12 @@ Look for: `"TESTING_MODE: FALSE"` and `"ENVIRONMENT: production"` in startup out
 | Edit `~/.cloudflared/config.yml` | Changes ignored | Always edit `CLOUDFLARE_CONFIG_FILE` from machine-config |
 | Duplicate hostname in config | Second entry silently ignored | Grep before inserting |
 | Missing DNS CNAME | `curl` returns `000` | Create via Cloudflare API |
-| Deploy without setting `containerHttpPort` | nginx can't route | Always call update API first |
+| Deploy without setting `containerHttpPort` | nginx can't route | Always call update API before deploy |
 | Bake `.env` secrets into Docker image | Secrets in image layers | Set env vars in CapRover app config |
 | Forget to restart cloudflared after config edit | New hostname not active | Always `sudo systemctl restart cloudflared` |
 | Hardcode tunnel ID or domain | Breaks on other machines | Always read from `~/.claude/machine-config.md` |
+| Use wrong tarball upload endpoint | 404 from CapRover API | Correct endpoint: `POST /api/v2/user/apps/appData/[APP_NAME]` (app name in URL, not form field) |
+| Missing `output: 'standalone'` in next.config.mjs | Standalone Dockerfile fails silently | Always add it before building a Next.js Docker image |
+| No `public/` dir in repo with Next.js standalone | `COPY failed: stat app/public` build error | Add `mkdir -p /app/public` before `npm run build` in builder stage |
+| NEXT_PUBLIC_ vars only set as runtime env vars | Client bundle uses empty strings | Also set as `buildArgs` in CapRover and `ARG/ENV` in Dockerfile |
+| `hasPersistentData: false` for app with local disk writes | Data lost on every deploy/restart | Set `hasPersistentData: true` and configure a named volume |
