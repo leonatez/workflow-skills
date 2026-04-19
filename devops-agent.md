@@ -127,7 +127,17 @@ Check `package.json` for `NEXT_PUBLIC_*` variables used in the codebase:
 grep -r "NEXT_PUBLIC_" src/ --include="*.ts" --include="*.tsx" -l 2>/dev/null
 ```
 
-If any `NEXT_PUBLIC_*` vars exist, they are baked into the client bundle at **build time** — they must be passed as Docker build args, not just runtime env vars.
+If any `NEXT_PUBLIC_*` vars exist, they are baked into the client bundle at **build time**. CapRover does NOT support Docker build args via its API — they are silently ignored. Instead, create a `.env.production` file in the repo root. Next.js reads it automatically at build time. `NEXT_PUBLIC_*` values are safe to commit — they are exposed to the browser by design.
+
+```bash
+# Create .env.production with all NEXT_PUBLIC_ vars
+cat > .env.production <<EOF
+NEXT_PUBLIC_SUPABASE_URL=https://xxx.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
+EOF
+```
+
+Do NOT put secret vars (`SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, etc.) in `.env.production` — those go in CapRover env vars only.
 
 ```dockerfile
 FROM node:20-alpine AS deps
@@ -140,13 +150,7 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# Build-time vars — required for any NEXT_PUBLIC_ variables used in the app
-ARG NEXT_PUBLIC_SUPABASE_URL
-ARG NEXT_PUBLIC_SUPABASE_ANON_KEY
-ENV NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL
-ENV NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY
-# Add any other NEXT_PUBLIC_ vars here
-
+# .env.production in the repo provides NEXT_PUBLIC_ vars at build time
 ENV NEXT_TELEMETRY_DISABLED=1
 
 # Create public/ if not present in repo (COPY will fail if it doesn't exist)
@@ -285,10 +289,7 @@ curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
       {\"key\": \"SUPABASE_SERVICE_ROLE_KEY\", \"value\": \"$SUPABASE_SERVICE_ROLE_KEY\"},
       {\"key\": \"GEMINI_API_KEY\", \"value\": \"$GEMINI_API_KEY\"}
     ],
-    \"buildArgs\": [
-      {\"key\": \"NEXT_PUBLIC_SUPABASE_URL\", \"value\": \"$SUPABASE_URL\"},
-      {\"key\": \"NEXT_PUBLIC_SUPABASE_ANON_KEY\", \"value\": \"$SUPABASE_ANON_KEY\"}
-    ]
+    \"buildArgs\": []
   }"
 ```
 
@@ -785,5 +786,5 @@ Report to Boss Agent: "Auto-deploy configured. Every push to main on $GITHUB_REP
 | Use wrong tarball upload endpoint | 404 from CapRover API | Correct endpoint: `POST /api/v2/user/apps/appData/[APP_NAME]` (app name in URL, not form field) |
 | Missing `output: 'standalone'` in next.config.mjs | Standalone Dockerfile fails silently | Always add it before building a Next.js Docker image |
 | No `public/` dir in repo with Next.js standalone | `COPY failed: stat app/public` build error | Add `mkdir -p /app/public` before `npm run build` in builder stage |
-| NEXT_PUBLIC_ vars only set as runtime env vars | Client bundle uses empty strings | Also set as `buildArgs` in CapRover and `ARG/ENV` in Dockerfile |
+| NEXT_PUBLIC_ vars only set as CapRover runtime env vars | Client bundle uses empty strings | CapRover buildArgs are silently ignored — use `.env.production` in the repo instead |
 | `hasPersistentData: false` for app with local disk writes | Data lost on every deploy/restart | Set `hasPersistentData: true` and configure a named volume |
