@@ -599,60 +599,31 @@ Look for: `"TESTING_MODE: FALSE"` and `"ENVIRONMENT: production"` in startup out
 
 Sets up push-to-deploy: every push to `main` triggers a CapRover rebuild automatically.
 
+**Do not use `caprover/deploy-to-caprover` — that action does not exist on GitHub and will cause an immediate "Set up job" failure. Use direct CapRover API calls instead (see 10.4).**
+
 ### 10.1 — Prerequisites
 
-From machine-config: `GITHUB_PAT`, `CAPROVER_URL`
-From CapRover: per-app deploy token (Step 10.2)
+From machine-config: `GITHUB_PAT`, `CAPROVER_URL`, `CAPROVER_PASSWORD`
 From project: GitHub repo URL (e.g. `https://github.com/leonatez/myapp`)
 
-Extract owner and repo name:
 ```bash
 GITHUB_OWNER="leonatez"
 GITHUB_REPO="myapp"
 ```
 
-### 10.2 — Enable CapRover app deploy token
+### 10.2 — Add GitHub Actions secrets
+
+Three secrets are required: `CAPROVER_SERVER`, `CAPROVER_APP_NAME`, `CAPROVER_PASSWORD`.
 
 ```bash
-CAPROVER_TOKEN=$(curl -s -X POST "$CAPROVER_URL/api/v2/login" \
-  -H "Content-Type: application/json" \
-  -d "{\"password\": \"$CAPROVER_PASSWORD\"}" \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
-
-# Enable token for the app
-curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
-  -H "x-captain-auth: $CAPROVER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"appName\": \"$APP_NAME\", \"appDeployTokenConfig\": {\"enabled\": true}}"
-
-# Retrieve the token value
-APP_DEPLOY_TOKEN=$(curl -s "$CAPROVER_URL/api/v2/user/apps/appDefinitions" \
-  -H "x-captain-auth: $CAPROVER_TOKEN" \
-  | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-app = next(a for a in d['data']['appDefinitions'] if a['appName']=='$APP_NAME')
-print(app['appDeployTokenConfig']['appDeployToken'])
-")
-echo "App deploy token: $APP_DEPLOY_TOKEN"
-```
-
-### 10.3 — Add GitHub Actions secrets
-
-Get the repo public key first, then encrypt and push each secret using Node.js + libsodium-wrappers:
-
-```bash
-# Install libsodium-wrappers if needed
 npm install libsodium-wrappers --prefix /tmp/nacl --silent
 
-# Get repo public key
 PUBKEY_RESPONSE=$(curl -s \
   -H "Authorization: Bearer $GITHUB_PAT" \
   "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/actions/secrets/public-key")
 KEY_ID=$(echo $PUBKEY_RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['key_id'])")
 PUB_KEY=$(echo $PUBKEY_RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])")
 
-# Push secrets
 node -e "
 const sodium = require('/tmp/nacl/node_modules/libsodium-wrappers');
 const https = require('https');
@@ -665,14 +636,13 @@ const REPO = '$GITHUB_REPO';
 const secrets = {
   CAPROVER_SERVER: '$CAPROVER_URL',
   CAPROVER_APP_NAME: '$APP_NAME',
-  CAPROVER_APP_TOKEN: '$APP_DEPLOY_TOKEN',
+  CAPROVER_PASSWORD: '$CAPROVER_PASSWORD',
 };
 
 async function encryptSecret(pubKey, value) {
   await sodium.ready;
   const binKey = sodium.from_base64(pubKey, sodium.base64_variants.ORIGINAL);
-  const binVal = sodium.from_string(value);
-  const encrypted = sodium.crypto_box_seal(binVal, binKey);
+  const encrypted = sodium.crypto_box_seal(sodium.from_string(value), binKey);
   return sodium.to_base64(encrypted, sodium.base64_variants.ORIGINAL);
 }
 
@@ -690,14 +660,8 @@ async function putSecret(name, value) {
         'User-Agent': 'devops-agent',
         'Content-Length': Buffer.byteLength(body)
       }
-    }, res => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => resolve({ name, status: res.statusCode }));
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
+    }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve({name,status:res.statusCode})); });
+    req.on('error', reject); req.write(body); req.end();
   });
 }
 
@@ -710,11 +674,18 @@ async function putSecret(name, value) {
 "
 ```
 
-All three secrets must show `OK`. If any shows `FAIL`: check the PAT has `repo` + `secrets` scopes.
+All three must show `OK`. If any shows `FAIL`: check the PAT has `repo` + `secrets` scopes.
 
-### 10.4 — Create the workflow file
+### 10.3 — Create the workflow file
 
-Create `.github/workflows/deploy.yml` in the project repo:
+Create `.github/workflows/deploy.yml`. **All python3 calls must be single-line** — multiline python3 inside a `run: |` block breaks YAML parsing and causes the run to fail with zero jobs and no error message.
+
+Always validate YAML before committing:
+```bash
+python3 -c "import yaml; yaml.safe_load(open('.github/workflows/deploy.yml').read()); print('YAML valid')"
+```
+
+The workflow (copy exactly — do not modify the python3 lines to multiline):
 
 ```yaml
 name: Deploy to CapRover
@@ -729,45 +700,84 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy to CapRover
-        uses: caprover/deploy-to-caprover@v1
-        with:
-          server: ${{ secrets.CAPROVER_SERVER }}
-          app: ${{ secrets.CAPROVER_APP_NAME }}
-          token: ${{ secrets.CAPROVER_APP_TOKEN }}
+      - name: Create tarball
+        run: |
+          tar -czf /tmp/deploy.tar.gz \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='data' \
+            --exclude='.next' \
+            --exclude='logs' \
+            .
+
+      - name: Login and deploy
+        run: |
+          TOKEN=$(curl -s -X POST "${{ secrets.CAPROVER_SERVER }}/api/v2/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"password\": \"${{ secrets.CAPROVER_PASSWORD }}\"}" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
+
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to get CapRover token"
+            exit 1
+          fi
+
+          RESULT=$(curl -s -X POST \
+            "${{ secrets.CAPROVER_SERVER }}/api/v2/user/apps/appData/${{ secrets.CAPROVER_APP_NAME }}" \
+            -H "x-captain-auth: $TOKEN" \
+            -F "sourceFile=@/tmp/deploy.tar.gz")
+          echo "Upload result: $RESULT"
+          echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0) if d.get('status')==100 else exit(1)"
+
+          for i in $(seq 1 36); do
+            BUILDING=$(curl -s \
+              "${{ secrets.CAPROVER_SERVER }}/api/v2/user/apps/appData/${{ secrets.CAPROVER_APP_NAME }}" \
+              -H "x-captain-auth: $TOKEN" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['isAppBuilding'])")
+            echo "[$i] Building: $BUILDING"
+            [ "$BUILDING" = "False" ] && break
+            sleep 10
+          done
+
+          FAILED=$(curl -s \
+            "${{ secrets.CAPROVER_SERVER }}/api/v2/user/apps/appData/${{ secrets.CAPROVER_APP_NAME }}" \
+            -H "x-captain-auth: $TOKEN" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['isBuildFailed'])")
+
+          if [ "$FAILED" = "True" ]; then
+            echo "Build failed!"
+            exit 1
+          fi
+          echo "Deploy successful!"
 ```
 
-### 10.5 — Commit and push the workflow file
+### 10.4 — Commit and push
 
 ```bash
 cd /path/to/project
 git config user.email "hailinh.leo@gmail.com"
 git config user.name "leonatez"
-
-# Set remote to use PAT for auth
 git remote set-url origin "https://$GITHUB_PAT@github.com/$GITHUB_OWNER/$GITHUB_REPO.git"
-
-# Pull any remote changes first to avoid rejection
 git pull --rebase origin main
-
 git add .github/workflows/deploy.yml
 git commit -m "Add GitHub Actions auto-deploy to CapRover"
 git push origin main
 ```
 
-### 10.6 — Verify
-
-Check that the workflow appears and runs:
+### 10.5 — Verify
 
 ```bash
+# Wait ~20s for GitHub to register the run, then check
+sleep 20
 curl -s -H "Authorization: Bearer $GITHUB_PAT" \
-  "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/actions/workflows" \
-  | python3 -c "import sys,json; [print(w['name'], w['state']) for w in json.load(sys.stdin)['workflows']]"
+  "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/actions/runs?per_page=1" \
+  | python3 -c "import sys,json; r=json.load(sys.stdin)['workflow_runs'][0]; print(r['name'], r['status'], r['conclusion'])"
 ```
 
-Expected output: `Deploy to CapRover active`
+If conclusion is `failure` with zero jobs: YAML parse error — re-validate the workflow file.
+If conclusion is `failure` with jobs: check logs via `GET /repos/$OWNER/$REPO/actions/jobs/$JOB_ID/logs`.
 
-Report to Boss Agent: "Auto-deploy configured. Every push to main on $GITHUB_REPO will now trigger a CapRover rebuild at $CAPROVER_URL."
+Report to Boss Agent once conclusion is `success`.
 
 ---
 
@@ -788,3 +798,6 @@ Report to Boss Agent: "Auto-deploy configured. Every push to main on $GITHUB_REP
 | No `public/` dir in repo with Next.js standalone | `COPY failed: stat app/public` build error | Add `mkdir -p /app/public` before `npm run build` in builder stage |
 | NEXT_PUBLIC_ vars only set as CapRover runtime env vars | Client bundle uses empty strings | CapRover buildArgs are silently ignored — use `.env.production` in the repo instead |
 | `hasPersistentData: false` for app with local disk writes | Data lost on every deploy/restart | Set `hasPersistentData: true` and configure a named volume |
+| Using `caprover/deploy-to-caprover` GitHub Action | "Set up job" failure — action not found | That action doesn't exist; use direct CapRover API calls (see Step 10) |
+| Multiline python3 inside `run:` block (unindented) | Workflow fails with zero jobs, no error shown | Keep all python3 calls single-line in workflow files; validate YAML before committing |
+| Forgetting `CAPROVER_PASSWORD` secret in GitHub repo | Login step gets empty token, upload returns 401 | Add `CAPROVER_PASSWORD` as a GitHub secret alongside `CAPROVER_SERVER` and `CAPROVER_APP_NAME` |
