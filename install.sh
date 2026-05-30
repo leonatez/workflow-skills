@@ -59,8 +59,8 @@ else
   ok "Created machine config: $MACHINE_CONFIG"
   echo ""
   echo "  Next step: edit $MACHINE_CONFIG"
-  echo "  Fill in your CAPROVER_URL, TUNNEL_ID, TUNNEL_CNAME_TARGET,"
-  echo "  CLOUDFLARE_CONFIG_FILE, and DOMAIN for this machine."
+  echo "  Fill in your COOLIFY_URL, COOLIFY_API_TOKEN, TUNNEL_ID,"
+  echo "  TUNNEL_CNAME_TARGET, CLOUDFLARE_CONFIG_FILE, and DOMAIN for this machine."
 fi
 
 echo ""

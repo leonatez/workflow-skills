@@ -12,7 +12,7 @@ A multi-agent app development workflow for [Claude Code](https://claude.ai/code)
 | [`frontend-pm.md`](frontend-pm.md) | **Frontend PM** | Owns everything the user sees. Produces user stories, wireframes, high-fidelity HTML mockups, and test cases — in that order, with approval gates. |
 | [`backend-pm.md`](backend-pm.md) | **Backend PM** | Owns the API, data models, auth, and infrastructure. FastAPI + Supabase stack. Produces architecture doc, OpenAPI spec, structured logging, and power-admin test account. |
 | [`qa-agent.md`](qa-agent.md) | **QA Agent** | Owns verification. Backend HTTP tests first, then headed Playwright browser tests the user can watch. Writes live diary, routes bugs to right PM, iterates until everything passes. |
-| [`devops-agent.md`](devops-agent.md) | **DevOps Agent** | Owns deployment. Creates Dockerfiles, deploys to CapRover, wires Cloudflare tunnel config, creates DNS records, verifies end-to-end traffic chain. |
+| [`devops-agent.md`](devops-agent.md) | **DevOps Agent** | Owns deployment. Registers backend + frontend apps in Coolify straight from the git repo (Nixpacks builds, no Dockerfiles), injects env vars, wires Cloudflare tunnel config, creates DNS records, enables push-to-main auto-deploy, verifies end-to-end traffic chain. |
 
 ---
 
@@ -33,11 +33,11 @@ You
       │         [Bug routing: Frontend PM or Backend PM, max 3 fix rounds]
       ├── Phase 4: Feature sign-off (health score ≥ 80, TESTING_MODE reset to FALSE)
       └── Phase 5: Activates DevOps Agent
-           ├── Create Dockerfiles (if not exist)
-           ├── Deploy backend + frontend to CapRover
-           ├── Add hostnames to /etc/cloudflared/config.yml + restart cloudflared
+           ├── Create Coolify project + apps from the git repo (Nixpacks, no Dockerfiles)
+           ├── Inject env vars, enable push-to-main auto-deploy, trigger build
+           ├── Add hostnames to /etc/cloudflared/config.yml (→ localhost:80) + restart cloudflared
            ├── Create Cloudflare DNS CNAME records via API
-           └── Verify full traffic chain: Browser → Cloudflare → tunnel → nginx → container
+           └── Verify full traffic chain: Browser → Cloudflare → tunnel → Coolify Traefik → container
 ```
 
 ---
@@ -55,9 +55,11 @@ Every project built with this workflow uses:
 | API testing | `httpx` (Python) |
 | Design system | `DESIGN.md` (via gstack `/design-consultation`) |
 | Visual QA | gstack `/qa-only` (final sanity pass) |
-| Deployment | CapRover at `captain.crawlingrobo.com` |
-| Tunnel | Cloudflare Tunnel (`20a4ef64-b536-4021-ac2f-67eb9b17040a`) |
-| Domain | `crawlingrobo.com` |
+| Deployment | Coolify (dashboard at `admin.enginxlabs.com`) |
+| Build | Nixpacks (Coolify auto-build, no Dockerfiles) |
+| Auto-deploy | Coolify GitHub App — push to `main` redeploys (no GitHub Actions) |
+| Tunnel | Cloudflare Tunnel (`a27daddb-e6e9-49b8-8925-06a80210415f`) |
+| Domain | `enginxlabs.com` |
 
 ---
 
@@ -86,9 +88,10 @@ Every project built with this workflow uses:
 - GitHub repo URL
 - Playwright MCP configured: `claude mcp add playwright -- npx @playwright/mcp@latest --headless false`
 - Power-admin email preference (default: `admin@[project].test`)
-- CapRover app names (backend + frontend) and internal container ports
-- CapRover password
-- Cloudflare API token + Zone ID for `crawlingrobo.com`
+- Coolify app names (backend + frontend) and internal container ports
+- Coolify API token (machine-scoped, stored in `~/.claude/machine-config.md`)
+- GitHub App connected once in Coolify (Sources → GitHub App) with access to the repo
+- Cloudflare API token + Zone ID for `enginxlabs.com`
 
 ---
 
@@ -109,10 +112,7 @@ Every project built with this workflow uses:
 | `BACKEND_TEST_REPORT.md` | QA Agent | HTTP test proof with X-Request-ID per flow |
 | `QA_DIARY.md` | QA Agent | Live test diary with pass/fail per test case |
 | `QA_HANDOVER.md` | QA Agent | Final summary, health score, blocked items |
-| `Dockerfile` | DevOps Agent | Backend container definition |
-| `Dockerfile.frontend` | DevOps Agent | Frontend container definition |
-| `captain-definition` | DevOps Agent | CapRover build config (backend) |
-| `DEVOPS_HANDOVER.md` | DevOps Agent | Deployment summary, live URLs, DNS records created |
+| `DEVOPS_HANDOVER.md` | DevOps Agent | Deployment summary, live URLs, Coolify UUIDs, DNS records created |
 
 ---
 
@@ -134,15 +134,18 @@ The installer:
 After installing, open `~/.claude/machine-config.md` and fill in the values for that machine:
 
 ```
-DEPLOY_MODE=caprover-cloudflare
-CAPROVER_URL=https://captain.yourdomain.com
+DEPLOY_MODE=coolify-cloudflare
+COOLIFY_URL=http://localhost:8000
+COOLIFY_API_TOKEN=your-coolify-token   # ID|secret, scopes: read, read:sensitive, write, deploy
+COOLIFY_SERVER_UUID=                    # blank = auto-detect
+GITHUB_APP_UUID=                        # blank = auto-detect
 TUNNEL_ID=your-tunnel-id
 TUNNEL_CNAME_TARGET=your-tunnel-id.cfargotunnel.com
 CLOUDFLARE_CONFIG_FILE=/etc/cloudflared/config.yml
 DOMAIN=yourdomain.com
 ```
 
-Sensitive values (CapRover password, Cloudflare API token) are **not** stored in machine-config — they go in each project's `.env` file.
+The Coolify API token is machine-scoped, so it lives in machine-config (this file is local-only and never committed). The Cloudflare API token is project-scoped and goes in each project's `.env` file. Connect a GitHub App in Coolify once (Sources → GitHub App) so private repos can be deployed.
 
 ---
 

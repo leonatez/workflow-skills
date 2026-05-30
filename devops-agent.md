@@ -2,7 +2,7 @@
 
 ## Role
 
-The DevOps Agent owns deployment. It takes a QA-verified, signed-off feature and makes it live on production infrastructure. It creates Dockerfiles if they don't exist, deploys both frontend and backend apps to CapRover, wires up the Cloudflare tunnel config, creates DNS records, and verifies the full traffic chain end to end.
+The DevOps Agent owns deployment. It takes a QA-verified, signed-off feature and makes it live on production infrastructure. It creates a Coolify project, registers the backend and frontend apps directly from the GitHub repo (Coolify builds them with Nixpacks — no Dockerfiles needed), injects environment variables, wires up the Cloudflare tunnel config, creates DNS records, and verifies the full traffic chain end to end. Because the apps are connected to the git repo with auto-deploy enabled, every later push to `main` redeploys automatically — there is no GitHub Actions workflow to maintain.
 
 **The DevOps Agent never interacts directly with the user.** All communication goes through the Boss Agent.
 
@@ -25,363 +25,328 @@ Then fill in ~/.claude/machine-config.md with this machine's infrastructure valu
 ```
 
 Extract and hold these values for use throughout this skill:
-- `DEPLOY_MODE` — if not `caprover-cloudflare`, stop and report to Boss Agent that this machine's deploy mode is not supported by this agent
-- `CAPROVER_URL` — the CapRover dashboard URL
+- `DEPLOY_MODE` — if not `coolify-cloudflare`, stop and report to Boss Agent that this machine's deploy mode is not supported by this agent
+- `COOLIFY_URL` — the Coolify base URL (e.g. `http://localhost:8000` when the agent runs on the same box, or `https://admin.enginxlabs.com`). The API base is `$COOLIFY_URL/api/v1`.
+- `COOLIFY_API_TOKEN` — Coolify API token in `ID|secret` format. Machine-scoped (one token per Coolify instance/team). If present in machine-config, use it; otherwise fall back to project `.env`.
+- `COOLIFY_SERVER_UUID` — target server UUID (optional; auto-detected in Step 3 if absent)
+- `GITHUB_APP_UUID` — UUID of the GitHub App connected inside Coolify (optional; auto-detected in Step 3 if absent)
 - `TUNNEL_ID` — Cloudflare tunnel ID
 - `TUNNEL_CNAME_TARGET` — `TUNNEL_ID.cfargotunnel.com`
 - `CLOUDFLARE_CONFIG_FILE` — path to cloudflared config (usually `/etc/cloudflared/config.yml`)
-- `DOMAIN` — root domain (e.g. `crawlingrobo.com`)
+- `DOMAIN` — root domain (e.g. `enginxlabs.com`)
 - `CLOUDFLARE_API_TOKEN` — if present in machine-config, use it. Otherwise read from project `.env`.
 - `CLOUDFLARE_ZONE_ID` — same: prefer machine-config, fall back to `.env`.
-- `GITHUB_PAT` — if present in machine-config, use it for GitHub API calls (adding secrets, pushing workflow files).
 
 ---
 
 ## Step 1 — Read project credentials
 
 ```bash
-export CAPROVER_PASSWORD=$(grep ^CAPROVER_PASSWORD .env | cut -d '=' -f2-)
+# Coolify token — prefer machine-config value loaded in Step 0; fall back to .env
+export COOLIFY_API_TOKEN=${COOLIFY_API_TOKEN:-$(grep ^COOLIFY_API_TOKEN .env | cut -d '=' -f2-)}
 
 # Cloudflare — prefer machine-config values loaded in Step 0; fall back to .env
 export CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-$(grep ^CLOUDFLARE_API_TOKEN .env | cut -d '=' -f2-)}
 export CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID:-$(grep ^CLOUDFLARE_ZONE_ID .env | cut -d '=' -f2-)}
+
+# App secrets (injected into Coolify, never committed)
+export SUPABASE_URL=$(grep ^SUPABASE_URL .env | cut -d '=' -f2-)
+export SUPABASE_ANON_KEY=$(grep ^SUPABASE_ANON_KEY .env | cut -d '=' -f2-)
+export SUPABASE_SERVICE_ROLE_KEY=$(grep ^SUPABASE_SERVICE_ROLE_KEY .env | cut -d '=' -f2-)
 ```
 
-If `CAPROVER_PASSWORD` is empty: stop. Report `NEEDS_CONTEXT` to Boss Agent.
+If `COOLIFY_API_TOKEN` is empty: stop. Report `NEEDS_CONTEXT` to Boss Agent.
 If `CLOUDFLARE_API_TOKEN` or `CLOUDFLARE_ZONE_ID` are still empty after both checks: report `NEEDS_CONTEXT`.
 
 Also read from `PROJECT_CONFIG.md`:
-- Backend CapRover app name
-- Frontend CapRover app name
-- Backend internal container port
-- Frontend internal container port
-- Whether the app needs persistent storage (e.g. local disk, uploads)
+- GitHub repository URL and default branch
+- Backend app name (e.g. `myproject-api`)
+- Frontend app name (e.g. `myproject`)
+- Backend internal container port (the port FastAPI/uvicorn listens on — default `8000`)
+- Frontend internal container port (the port the frontend server listens on — default `3000`)
+- Coolify project UUID, backend app UUID, frontend app UUID — **if already present** from a previous run (created in Step 4). If present, this is a re-deploy: skip creation and reuse the UUIDs.
+- Whether the app needs persistent storage (local disk, uploads)
+
+A quick sanity check on the token before going further:
+
+```bash
+curl -s "$COOLIFY_URL/api/v1/teams/current" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" | head -c 200
+```
+
+If this returns `401`/`Unauthenticated`: stop. Report `BLOCKED` — Coolify token invalid or expired. The user must mint a new token at `$COOLIFY_URL` → Keys & Tokens → API tokens (scopes: `read`, `read:sensitive`, `write`, `deploy`).
 
 ---
 
-## Step 2 — Dockerfiles
+## Step 2 — Repository layout & build settings (no Dockerfiles)
 
-### 2.1 — Check for existing Dockerfiles
+Coolify builds each app with **Nixpacks** straight from the git repo — it auto-detects Python and Node. There are no Dockerfiles to create. The agent's job here is to determine, for each app, **which subdirectory** it lives in and **how it starts**.
 
-```bash
-ls Dockerfile Dockerfile.frontend captain-definition 2>/dev/null
-```
-
-If all exist: skip to Step 3.
-
-### 2.2 — Backend Dockerfile (FastAPI)
-
-If `Dockerfile` does not exist, create it:
-
-```dockerfile
-FROM python:3.12-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-EXPOSE [BACKEND_INTERNAL_PORT]
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "[BACKEND_INTERNAL_PORT]"]
-```
-
-**Never bake secrets into the image.** All env vars (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `TESTING_MODE`, etc.) are injected via CapRover app config at deploy time.
-
-### 2.3 — Frontend Dockerfile
-
-Detect framework first:
+### 2.1 — Detect layout
 
 ```bash
-[ -f "package.json" ] && grep -q '"next"' package.json && echo "FRAMEWORK:nextjs"
-[ -f "package.json" ] && grep -q '"vite"' package.json && echo "FRAMEWORK:vite"
-[ -f "package.json" ] && grep -q '"react-scripts"' package.json && echo "FRAMEWORK:cra"
+# Backend: where is requirements.txt / pyproject.toml?
+ls requirements.txt pyproject.toml backend/requirements.txt 2>/dev/null
+
+# Frontend: where is package.json, and which framework?
+ls package.json frontend/package.json 2>/dev/null
+grep -l '"next"' package.json frontend/package.json 2>/dev/null && echo "FRAMEWORK:nextjs"
+grep -l '"vite"' package.json frontend/package.json 2>/dev/null && echo "FRAMEWORK:vite"
 ```
 
-**Next.js:**
+From this determine, for each app, the **base directory** relative to the repo root:
+- Both at root (single-purpose repo) → `base_directory = /`
+- Monorepo with `backend/` and `frontend/` → set each app's `base_directory` accordingly
 
-Before creating the Dockerfile, check `next.config.mjs` (or `next.config.js`) for `output: 'standalone'`. If it is missing, add it:
+Hold these as `BACKEND_BASE_DIR` and `FRONTEND_BASE_DIR`.
 
-```js
-const nextConfig = {
-  output: 'standalone',
-  // ... rest of config
-};
-```
+### 2.2 — Determine start commands & ports
 
-This is required — the Dockerfile copies from `.next/standalone` and will fail silently without it.
+Nixpacks infers the build, but the **start command** often needs to be explicit. Hold these for the create call in Step 4:
 
-Also check if the repo has a `public/` directory:
+| App | `ports_exposes` | `start_command` |
+|-----|-----------------|-----------------|
+| Backend (FastAPI) | `8000` (or `PROJECT_CONFIG` value) | `uvicorn app.main:app --host 0.0.0.0 --port 8000` |
+| Frontend (Next.js) | `3000` | leave empty — Nixpacks runs `npm run build` then `npm start` |
+| Frontend (Vite/static SPA) | `3000` | set `is_static: true`, `is_spa: true` (Nixpacks serves the built `dist/`) |
+
+Adjust the uvicorn module path (`app.main:app`) if the repo's entrypoint differs — check `ARCHITECTURE.md` or grep for `FastAPI(`.
+
+### 2.3 — NEXT_PUBLIC_* build-time variables
+
+`NEXT_PUBLIC_*` vars are baked into the client bundle at **build time**. With Nixpacks, Coolify exposes the app's environment variables to the build, so they must be set in Coolify (Step 4.3) **before the first build runs**. That is why Step 4 creates apps with `instant_deploy: false`, sets env vars, and only then triggers the build.
+
+Find which `NEXT_PUBLIC_*` vars the frontend uses:
 
 ```bash
-ls public/ 2>/dev/null || echo "NO_PUBLIC_DIR"
+grep -rho "NEXT_PUBLIC_[A-Z_]*" "${FRONTEND_BASE_DIR:-.}/src" 2>/dev/null | sort -u
 ```
 
-If `public/` does not exist, the `COPY --from=builder /app/public ./public` step will fail at build time. The Dockerfile below handles this by creating it before the build.
-
-Check `package.json` for `NEXT_PUBLIC_*` variables used in the codebase:
-
-```bash
-grep -r "NEXT_PUBLIC_" src/ --include="*.ts" --include="*.tsx" -l 2>/dev/null
-```
-
-If any `NEXT_PUBLIC_*` vars exist, they are baked into the client bundle at **build time**. CapRover does NOT support Docker build args via its API — they are silently ignored. Instead, create a `.env.production` file in the repo root. Next.js reads it automatically at build time. `NEXT_PUBLIC_*` values are safe to commit — they are exposed to the browser by design.
-
-```bash
-# Create .env.production with all NEXT_PUBLIC_ vars
-cat > .env.production <<EOF
-NEXT_PUBLIC_SUPABASE_URL=https://xxx.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
-EOF
-```
-
-Do NOT put secret vars (`SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, etc.) in `.env.production` — those go in CapRover env vars only.
-
-```dockerfile
-FROM node:20-alpine AS deps
-WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm ci
-
-FROM node:20-alpine AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-
-# .env.production in the repo provides NEXT_PUBLIC_ vars at build time
-ENV NEXT_TELEMETRY_DISABLED=1
-
-# Create public/ if not present in repo (COPY will fail if it doesn't exist)
-RUN mkdir -p /app/public && npm run build
-
-FROM node:20-alpine AS runner
-WORKDIR /app
-
-ENV NODE_ENV=production
-ENV NEXT_TELEMETRY_DISABLED=1
-
-RUN addgroup --system --gid 1001 nodejs && \
-    adduser --system --uid 1001 nextjs
-
-COPY --from=builder /app/public ./public
-COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
-COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
-
-# If the app uses local disk storage (e.g. data/), create and own the directory
-# RUN mkdir -p /app/data && chown -R nextjs:nodejs /app/data
-
-USER nextjs
-
-EXPOSE [FRONTEND_INTERNAL_PORT]
-ENV PORT=[FRONTEND_INTERNAL_PORT]
-ENV HOSTNAME="0.0.0.0"
-
-CMD ["node", "server.js"]
-```
-
-**Vite / static SPA:**
-```dockerfile
-FROM node:20-alpine AS builder
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci
-COPY . .
-RUN npm run build
-
-FROM nginx:alpine
-COPY --from=builder /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
-EXPOSE [FRONTEND_INTERNAL_PORT]
-CMD ["nginx", "-g", "daemon off;"]
-```
-
-With `nginx.conf`:
-```nginx
-server {
-    listen [FRONTEND_INTERNAL_PORT];
-    root /usr/share/nginx/html;
-    index index.html;
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-}
-```
-
-### 2.4 — captain-definition files
-
-**Backend (`captain-definition`):**
-```json
-{
-  "schemaVersion": 2,
-  "dockerfilePath": "./Dockerfile"
-}
-```
-
-**Frontend (`captain-definition.frontend`):**
-```json
-{
-  "schemaVersion": 2,
-  "dockerfilePath": "./Dockerfile.frontend"
-}
-```
+`NEXT_PUBLIC_*` values are public by design (exposed to the browser). **Never** put secret vars (`SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, etc.) under a `NEXT_PUBLIC_` name or on the frontend app at all — those belong only on the backend app.
 
 ---
 
-## Step 3 — Authenticate with CapRover API
+## Step 3 — Resolve Coolify server & GitHub App
+
+All API calls use the header `Authorization: Bearer $COOLIFY_API_TOKEN` and JSON bodies.
+
+### 3.1 — Server UUID
 
 ```bash
-CAPROVER_TOKEN=$(curl -s -X POST "$CAPROVER_URL/api/v2/login" \
+COOLIFY_SERVER_UUID=${COOLIFY_SERVER_UUID:-$(curl -s "$COOLIFY_URL/api/v1/servers" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  | python3 -c "import sys,json; s=json.load(sys.stdin); print(s[0]['uuid'])")}
+echo "Server UUID: $COOLIFY_SERVER_UUID"
+```
+
+If there is more than one server, prefer the one named `localhost` or matching this machine. If empty: report `BLOCKED` — no Coolify server reachable via API.
+
+### 3.2 — GitHub App UUID
+
+The repo is private, so apps are created via the **GitHub App** connection configured once inside Coolify.
+
+```bash
+GITHUB_APP_UUID=${GITHUB_APP_UUID:-$(curl -s "$COOLIFY_URL/api/v1/github-apps" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  | python3 -c "import sys,json; a=json.load(sys.stdin); print(a[0]['uuid'])")}
+echo "GitHub App UUID: $GITHUB_APP_UUID"
+```
+
+If the list is empty: report `BLOCKED` to Boss Agent:
+```
+BLOCKED: No GitHub App connected in Coolify.
+The user must connect one once: $COOLIFY_URL → Sources → + Add → GitHub App,
+install it on the GitHub account/org and grant access to the target repo.
+Then re-run deployment.
+```
+
+> If the repo is **public**, you may instead use `POST /api/v1/applications/public` (no `github_app_uuid`). Everything else below is identical.
+
+---
+
+## Step 4 — Create the Coolify project and apps
+
+### 4.1 — Create (or reuse) the project
+
+If `PROJECT_CONFIG.md` already has a Coolify project UUID, reuse it. Otherwise create one:
+
+```bash
+PROJECT_UUID=$(curl -s -X POST "$COOLIFY_URL/api/v1/projects" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"password\": \"$CAPROVER_PASSWORD\"}" \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
-
-echo "CapRover token: ${CAPROVER_TOKEN:0:20}..."
+  -d "{\"name\": \"[PROJECT_NAME]\", \"description\": \"Created by DevOps Agent\"}" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['uuid'])")
+echo "Project UUID: $PROJECT_UUID"
 ```
 
-If the token is empty: stop. Report `BLOCKED` — CapRover authentication failed. Check `CAPROVER_PASSWORD` in `.env` and confirm `CAPROVER_URL` in `~/.claude/machine-config.md` is correct.
+A `production` environment is created with the project. Write `PROJECT_UUID` back into `PROJECT_CONFIG.md`.
 
----
-
-## Step 4 — Create and configure apps in CapRover
-
-For each app (backend, frontend):
-
-### 4.1 — Check if app exists
+### 4.2 — Check whether the apps already exist
 
 ```bash
-curl -s "$CAPROVER_URL/api/v2/user/apps/appDefinitions" \
-  -H "x-captain-auth: $CAPROVER_TOKEN" \
-  | python3 -c "import sys,json; names=[a['appName'] for a in json.load(sys.stdin)['data']['appDefinitions']]; print('EXISTS' if '[APP_NAME]' in names else 'NOT_FOUND')"
+curl -s "$COOLIFY_URL/api/v1/applications" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  | python3 -c "import sys,json; n=[a.get('name') for a in json.load(sys.stdin)]; print('backend EXISTS' if '[BACKEND_APP_NAME]' in n else 'backend NOT_FOUND'); print('frontend EXISTS' if '[FRONTEND_APP_NAME]' in n else 'frontend NOT_FOUND')"
 ```
 
-### 4.2 — Create if not found
+If an app exists, capture its `uuid` from the same list and skip its creation in 4.3 — go straight to env vars (4.3 envs) and deploy (Step 5).
 
-Set `hasPersistentData` to `true` if the app writes to local disk (uploads, project files, etc.).
+### 4.3 — Create each app from the git repo (auto-deploy on)
 
-```bash
-curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/register" \
-  -H "x-captain-auth: $CAPROVER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"appName\": \"[APP_NAME]\", \"hasPersistentData\": false}"
-```
+Create with `instant_deploy: false` so env vars can be set before the first build. Domains use **http** (Cloudflare terminates TLS at its edge; the tunnel is plaintext to Coolify) and `is_force_https_enabled: false` to avoid Traefik redirect loops behind the tunnel.
 
-### 4.3 — Set HTTP port, env vars, build args, and volumes
-
-Do this in a single update call per app. For Next.js apps with `NEXT_PUBLIC_*` variables, include `buildArgs` so they are passed to `docker build --build-arg`.
+**Backend:**
 
 ```bash
-curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
-  -H "x-captain-auth: $CAPROVER_TOKEN" \
+BACKEND_UUID=$(curl -s -X POST "$COOLIFY_URL/api/v1/applications/private-github-app" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{
-    \"appName\": \"[APP_NAME]\",
-    \"instanceCount\": 1,
-    \"containerHttpPort\": [INTERNAL_PORT],
-    \"notExposeAsWebApp\": false,
-    \"forceSsl\": false,
-    \"hasPersistentData\": false,
-    \"envVars\": [
-      {\"key\": \"NODE_ENV\", \"value\": \"production\"},
-      {\"key\": \"NEXT_PUBLIC_SUPABASE_URL\", \"value\": \"$SUPABASE_URL\"},
-      {\"key\": \"NEXT_PUBLIC_SUPABASE_ANON_KEY\", \"value\": \"$SUPABASE_ANON_KEY\"},
-      {\"key\": \"SUPABASE_SERVICE_ROLE_KEY\", \"value\": \"$SUPABASE_SERVICE_ROLE_KEY\"},
-      {\"key\": \"GEMINI_API_KEY\", \"value\": \"$GEMINI_API_KEY\"}
-    ],
-    \"buildArgs\": []
-  }"
+    \"project_uuid\": \"$PROJECT_UUID\",
+    \"server_uuid\": \"$COOLIFY_SERVER_UUID\",
+    \"environment_name\": \"production\",
+    \"github_app_uuid\": \"$GITHUB_APP_UUID\",
+    \"git_repository\": \"[GITHUB_REPO_URL]\",
+    \"git_branch\": \"main\",
+    \"build_pack\": \"nixpacks\",
+    \"name\": \"[BACKEND_APP_NAME]\",
+    \"base_directory\": \"$BACKEND_BASE_DIR\",
+    \"ports_exposes\": \"8000\",
+    \"start_command\": \"uvicorn app.main:app --host 0.0.0.0 --port 8000\",
+    \"domains\": \"http://[BACKEND_APP_NAME].$DOMAIN\",
+    \"is_force_https_enabled\": false,
+    \"is_auto_deploy_enabled\": true,
+    \"instant_deploy\": false
+  }" | python3 -c "import sys,json; print(json.load(sys.stdin)['uuid'])")
+echo "Backend app UUID: $BACKEND_UUID"
 ```
 
-If the app uses local disk storage, also include `volumes`:
-
-```json
-"volumes": [
-  {
-    "containerPath": "/app/data",
-    "volumeName": "[APP_NAME]-data"
-  }
-]
-```
-
-### 4.4 — Backend-specific env vars (FastAPI)
+**Frontend (Next.js):**
 
 ```bash
-curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
-  -H "x-captain-auth: $CAPROVER_TOKEN" \
+FRONTEND_UUID=$(curl -s -X POST "$COOLIFY_URL/api/v1/applications/private-github-app" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{
-    \"appName\": \"[BACKEND_APP_NAME]\",
-    \"envVars\": [
-      {\"key\": \"ENVIRONMENT\", \"value\": \"production\"},
-      {\"key\": \"TESTING_MODE\", \"value\": \"FALSE\"},
-      {\"key\": \"SUPABASE_URL\", \"value\": \"$SUPABASE_URL\"},
-      {\"key\": \"SUPABASE_ANON_KEY\", \"value\": \"$SUPABASE_ANON_KEY\"},
-      {\"key\": \"SUPABASE_SERVICE_ROLE_KEY\", \"value\": \"$SUPABASE_SERVICE_ROLE_KEY\"},
-      {\"key\": \"LOG_LEVEL\", \"value\": \"INFO\"}
-    ]
-  }"
+    \"project_uuid\": \"$PROJECT_UUID\",
+    \"server_uuid\": \"$COOLIFY_SERVER_UUID\",
+    \"environment_name\": \"production\",
+    \"github_app_uuid\": \"$GITHUB_APP_UUID\",
+    \"git_repository\": \"[GITHUB_REPO_URL]\",
+    \"git_branch\": \"main\",
+    \"build_pack\": \"nixpacks\",
+    \"name\": \"[FRONTEND_APP_NAME]\",
+    \"base_directory\": \"$FRONTEND_BASE_DIR\",
+    \"ports_exposes\": \"3000\",
+    \"domains\": \"http://[FRONTEND_APP_NAME].$DOMAIN\",
+    \"is_force_https_enabled\": false,
+    \"is_auto_deploy_enabled\": true,
+    \"instant_deploy\": false
+  }" | python3 -c "import sys,json; print(json.load(sys.stdin)['uuid'])")
+echo "Frontend app UUID: $FRONTEND_UUID"
 ```
+
+For a **Vite / static SPA** frontend, add `"is_static": true, "is_spa": true` and drop `ports_exposes` reliance (Coolify serves the built assets through its static server).
+
+Write `BACKEND_UUID` and `FRONTEND_UUID` back into `PROJECT_CONFIG.md`.
+
+### 4.3 (envs) — Set environment variables
+
+Use the **bulk** endpoint per app. Secrets live only in Coolify — never committed, never baked into a build image.
+
+**Backend (FastAPI):**
+
+```bash
+curl -s -X PATCH "$COOLIFY_URL/api/v1/applications/$BACKEND_UUID/envs/bulk" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"data\": [
+    {\"key\": \"ENVIRONMENT\", \"value\": \"production\"},
+    {\"key\": \"TESTING_MODE\", \"value\": \"FALSE\"},
+    {\"key\": \"SUPABASE_URL\", \"value\": \"$SUPABASE_URL\"},
+    {\"key\": \"SUPABASE_ANON_KEY\", \"value\": \"$SUPABASE_ANON_KEY\"},
+    {\"key\": \"SUPABASE_SERVICE_ROLE_KEY\", \"value\": \"$SUPABASE_SERVICE_ROLE_KEY\"},
+    {\"key\": \"LOG_LEVEL\", \"value\": \"INFO\"}
+  ]}"
+```
+
+**Frontend (Next.js)** — include every `NEXT_PUBLIC_*` var found in Step 2.3 (these are baked at build time) plus any public runtime vars:
+
+```bash
+curl -s -X PATCH "$COOLIFY_URL/api/v1/applications/$FRONTEND_UUID/envs/bulk" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"data\": [
+    {\"key\": \"NODE_ENV\", \"value\": \"production\"},
+    {\"key\": \"NEXT_PUBLIC_SUPABASE_URL\", \"value\": \"$SUPABASE_URL\"},
+    {\"key\": \"NEXT_PUBLIC_SUPABASE_ANON_KEY\", \"value\": \"$SUPABASE_ANON_KEY\"}
+  ]}"
+```
+
+### 4.4 — Persistent storage (only if the app writes to local disk)
+
+```bash
+curl -s -X POST "$COOLIFY_URL/api/v1/applications/$BACKEND_UUID/storages" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\": \"[APP_NAME]-data\", \"mount_path\": \"/app/data\"}"
+```
+
+Without this, container-local writes are lost on every redeploy.
 
 ---
 
-## Step 5 — Deploy to CapRover
+## Step 5 — Deploy
 
-### Option A — Tarball upload (preferred — works without interactive login)
+Trigger the first build now that env vars are in place (`force=true` builds without cache for a clean first deploy):
 
 ```bash
-tar -czf /tmp/deploy.tar.gz \
-  --exclude='.git' \
-  --exclude='node_modules' \
-  --exclude='__pycache__' \
-  --exclude='.env' \
-  --exclude='data' \
-  --exclude='.next' \
-  --exclude='logs' \
-  .
-
-curl -s -X POST "$CAPROVER_URL/api/v2/user/apps/appData/[APP_NAME]" \
-  -H "x-captain-auth: $CAPROVER_TOKEN" \
-  -F "sourceFile=@/tmp/deploy.tar.gz"
+for UUID in "$BACKEND_UUID" "$FRONTEND_UUID"; do
+  curl -s "$COOLIFY_URL/api/v1/deploy?uuid=$UUID&force=true" \
+    -H "Authorization: Bearer $COOLIFY_API_TOKEN"
+  echo
+done
 ```
 
-**Note:** The app name goes in the URL path, not as a form field. The correct endpoint is `/api/v2/user/apps/appData/[APP_NAME]`.
+The response contains a `deployments` array with a `deployment_uuid` per app — capture it.
 
-### Option B — caprover CLI (requires interactive login session)
+### 5.1 — Wait for each build to complete
 
-```bash
-caprover --version 2>/dev/null || npm install -g caprover
-
-caprover deploy \
-  --host "$CAPROVER_URL" \
-  --appToken "$CAPROVER_TOKEN" \
-  --appName "[APP_NAME]" \
-  --branch main
-```
-
-### 5.1 — Wait for build to complete
+Poll the deployment status. Coolify status values progress `queued` → `in_progress` → `finished` (or `failed` / `cancelled-by-user`):
 
 ```bash
-until [ "$(curl -s "$CAPROVER_URL/api/v2/user/apps/appData/[APP_NAME]" \
-  -H "x-captain-auth: $CAPROVER_TOKEN" \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['isAppBuilding'])")" = "False" ]; do
+DEPLOY_UUID="[deployment_uuid from Step 5]"
+until curl -s "$COOLIFY_URL/api/v1/deployments/$DEPLOY_UUID" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  | python3 -c "import sys,json; s=json.load(sys.stdin).get('status',''); print(s); exit(0 if s in ('finished','failed','cancelled-by-user') else 1)"; do
   sleep 5
 done
-
-curl -s "$CAPROVER_URL/api/v2/user/apps/appData/[APP_NAME]" \
-  -H "x-captain-auth: $CAPROVER_TOKEN" \
-  | python3 -c "import sys,json; d=json.load(sys.stdin); print('Failed:', d['data']['isBuildFailed']); [print(l, end='') for l in d['data']['logs']['lines'][-30:]]"
 ```
 
-If `isBuildFailed` is `True`: read the full log output and diagnose before retrying. Common Next.js failures:
-- `COPY failed: stat app/public: file does not exist` → repo has no `public/` dir; add `mkdir -p /app/public` before `npm run build` in the builder stage
-- `output: 'standalone'` missing → add it to `next.config.mjs` and redeploy
+Then check the application's runtime status and recent logs:
 
-If build does not complete after 5 minutes: report `BLOCKED` to Boss Agent with the CapRover app URL for manual log inspection: `$CAPROVER_URL/apps/details/[APP_NAME]`.
+```bash
+curl -s "$COOLIFY_URL/api/v1/applications/$BACKEND_UUID" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('app status:', d.get('status'))"
+
+curl -s "$COOLIFY_URL/api/v1/applications/$BACKEND_UUID/logs?lines=50" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN"
+```
+
+If status is `failed`: pull the build log and diagnose before retrying. Common Nixpacks issues:
+- **No start command for FastAPI** → app builds but exits immediately; set `start_command` (Step 2.2) and redeploy.
+- **Wrong `base_directory`** → "no buildable files found"; fix the subdirectory (Step 2.1).
+- **`NEXT_PUBLIC_*` empty in the bundle** → env vars were not set before the build; set them (Step 4.3 envs) and redeploy with `force=true`.
+- **Wrong `ports_exposes`** → build succeeds but Traefik can't reach the container; set it to the port the process actually listens on.
+
+If a build does not complete after ~5 minutes: report `BLOCKED` to Boss Agent with the app URL for manual log inspection: `$COOLIFY_URL` → the project → the app → Deployments.
 
 ---
 
 ## Step 6 — Cloudflare Tunnel Config
+
+Traffic reaches Coolify's built-in Traefik proxy on **port 80**; Traefik routes to the right container by matching the `Host` header against each app's configured domain. So the tunnel only ever needs to point app hostnames at `http://localhost:80` — never the Coolify dashboard port (8000) and never a container's direct port.
 
 Use `CLOUDFLARE_CONFIG_FILE` from `~/.claude/machine-config.md` (not hardcoded).
 
@@ -399,8 +364,7 @@ sudo grep "[APP_NAME].$DOMAIN" "$CLOUDFLARE_CONFIG_FILE" && echo "EXISTS" || ech
 
 ### 6.3 — Add missing entries
 
-Always use `http://localhost:80` — never the app's direct container port.
-CapRover's nginx routes by Host header internally to the correct container.
+Insert each app hostname before the catch-all `- service: http_status:404`. Leave the existing Coolify dashboard entry (e.g. `admin.$DOMAIN → http://localhost:8000`) untouched.
 
 ```bash
 sudo python3 - <<EOF
@@ -454,8 +418,9 @@ sudo cat "$CLOUDFLARE_CONFIG_FILE"
 
 Confirm:
 - New hostname entries appear before `- service: http_status:404`
+- Every app entry points to `http://localhost:80` (not 8000, not a container port)
 - No duplicate entries
-- CapRover dashboard entry (`captain.$DOMAIN`) is untouched
+- Coolify dashboard entry (`admin.$DOMAIN → http://localhost:8000`) is untouched
 - Catch-all is still last
 
 ### 6.5 — Restart cloudflared
@@ -530,10 +495,10 @@ done
 | Code | Meaning | Action |
 |------|---------|--------|
 | 200–299 | Working | ✅ Pass |
-| 301–302 | Redirect (HTTP→HTTPS) | ✅ Pass — follow and recheck |
+| 301–302 | Redirect (HTTP→HTTPS) | ✅ Pass — follow and recheck. If it loops, check `is_force_https_enabled` is `false` |
 | 404 from app | App live, route not found | ✅ Chain works — app-level issue |
-| 404 from nginx HTML | CapRover has no app matching hostname | ❌ App name mismatch — check CapRover |
-| 502 / 503 | Container crashed or not running | ❌ Check CapRover build log |
+| 404 from Traefik | No Coolify app matches that Host | ❌ Domain mismatch — confirm app `domains` == `[APP_NAME].$DOMAIN` |
+| 502 / 503 | Container crashed, not running, or wrong `ports_exposes` | ❌ Check Coolify app status + build log |
 | 000 | DNS not resolving | ❌ CNAME missing or not propagated — wait 2 min and retry |
 
 ### 8.3 — Backend health check
@@ -544,9 +509,14 @@ curl -s "https://[BACKEND_APP_NAME].$DOMAIN/health"
 
 ### 8.4 — Confirm TESTING_MODE=FALSE in production
 
-Check the startup log in CapRover at: `$CAPROVER_URL/apps/details/[BACKEND_APP_NAME]`
+Check the startup log:
 
-Look for: `"TESTING_MODE: FALSE"` and `"ENVIRONMENT: production"` in startup output.
+```bash
+curl -s "$COOLIFY_URL/api/v1/applications/$BACKEND_UUID/logs?lines=80" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" | grep -E "TESTING_MODE|ENVIRONMENT"
+```
+
+Look for `TESTING_MODE: FALSE` and `ENVIRONMENT: production` in startup output.
 
 ---
 
@@ -557,7 +527,7 @@ Look for: `"TESTING_MODE: FALSE"` and `"ENVIRONMENT: production"` in startup out
 
 ## Deployment: [Feature / Project Name]
 ## Date: [date]
-## Machine: [CAPROVER_URL from machine-config]
+## Platform: Coolify @ [COOLIFY_URL from machine-config]
 ## Status: ✅ LIVE | ❌ BLOCKED
 
 ## URLs deployed
@@ -566,15 +536,16 @@ Look for: `"TESTING_MODE: FALSE"` and `"ENVIRONMENT: production"` in startup out
 | Backend | https://[backend-name].[DOMAIN] | [code] | ✅ / ❌ |
 | Frontend | https://[frontend-name].[DOMAIN] | [code] | ✅ / ❌ |
 
-## CapRover
-| App | Port | Env vars set | Build args set | Build |
-|-----|------|-------------|---------------|-------|
-| [backend] | [port] | ✅ | N/A | DEPLOYED |
-| [frontend] | [port] | ✅ | ✅ | DEPLOYED |
+## Coolify
+- Project UUID: [uuid]
+| App | UUID | Port | Build pack | Env vars set | Auto-deploy | Build |
+|-----|------|------|-----------|-------------|------------|-------|
+| [backend] | [uuid] | [port] | nixpacks | ✅ | on | finished |
+| [frontend] | [uuid] | [port] | nixpacks | ✅ | on | finished |
 
 ## Cloudflare tunnel
 - Config file: [CLOUDFLARE_CONFIG_FILE]
-- Entries added: ✅
+- Entries added (→ http://localhost:80): ✅
 - cloudflared restarted: ✅
 - cloudflared status: active (running)
 
@@ -589,195 +560,50 @@ Look for: `"TESTING_MODE: FALSE"` and `"ENVIRONMENT: production"` in startup out
 - TESTING_MODE in production: FALSE ✅
 - ENVIRONMENT: production ✅
 
+## Auto-deploy
+- Both apps connected to [repo] @ main with auto-deploy ON.
+- Every push to main redeploys automatically via Coolify's GitHub App webhook.
+- No GitHub Actions workflow required.
+
 ## Blocked items
 - [description] → [what user must do]
 ```
 
 ---
 
-## Step 10 — GitHub Actions Auto-Deploy (run once per project)
+## Step 10 — Auto-Deploy (already on — no GitHub Actions needed)
 
-Sets up push-to-deploy: every push to `main` triggers a CapRover rebuild automatically.
+Because each app was created from the git repo with `is_auto_deploy_enabled: true`, Coolify's GitHub App installs a webhook on the repo automatically. **Every push to `main` triggers a Coolify rebuild** — there is no `.github/workflows/deploy.yml` to create or maintain. This replaces the entire old CapRover + GitHub Actions deploy pipeline.
 
-**Do not use `caprover/deploy-to-caprover` — that action does not exist on GitHub and will cause an immediate "Set up job" failure. Use direct CapRover API calls instead (see 10.4).**
-
-### 10.1 — Prerequisites
-
-From machine-config: `GITHUB_PAT`, `CAPROVER_URL`, `CAPROVER_PASSWORD`
-From project: GitHub repo URL (e.g. `https://github.com/leonatez/myapp`)
+### 10.1 — Confirm auto-deploy is enabled
 
 ```bash
-GITHUB_OWNER="leonatez"
-GITHUB_REPO="myapp"
+for UUID in "$BACKEND_UUID" "$FRONTEND_UUID"; do
+  curl -s "$COOLIFY_URL/api/v1/applications/$UUID" \
+    -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('name'), 'auto_deploy:', d.get('is_auto_deploy_enabled') if 'is_auto_deploy_enabled' in d else d.get('settings',{}).get('is_auto_deploy_enabled'))"
+done
 ```
 
-### 10.2 — Add GitHub Actions secrets
-
-Three secrets are required: `CAPROVER_SERVER`, `CAPROVER_APP_NAME`, `CAPROVER_PASSWORD`.
+If it is off for either app, turn it on:
 
 ```bash
-npm install libsodium-wrappers --prefix /tmp/nacl --silent
-
-PUBKEY_RESPONSE=$(curl -s \
-  -H "Authorization: Bearer $GITHUB_PAT" \
-  "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/actions/secrets/public-key")
-KEY_ID=$(echo $PUBKEY_RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['key_id'])")
-PUB_KEY=$(echo $PUBKEY_RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])")
-
-node -e "
-const sodium = require('/tmp/nacl/node_modules/libsodium-wrappers');
-const https = require('https');
-const KEY_ID = '$KEY_ID';
-const PUB_KEY = '$PUB_KEY';
-const GH_TOKEN = '$GITHUB_PAT';
-const OWNER = '$GITHUB_OWNER';
-const REPO = '$GITHUB_REPO';
-
-const secrets = {
-  CAPROVER_SERVER: '$CAPROVER_URL',
-  CAPROVER_APP_NAME: '$APP_NAME',
-  CAPROVER_PASSWORD: '$CAPROVER_PASSWORD',
-};
-
-async function encryptSecret(pubKey, value) {
-  await sodium.ready;
-  const binKey = sodium.from_base64(pubKey, sodium.base64_variants.ORIGINAL);
-  const encrypted = sodium.crypto_box_seal(sodium.from_string(value), binKey);
-  return sodium.to_base64(encrypted, sodium.base64_variants.ORIGINAL);
-}
-
-async function putSecret(name, value) {
-  const encrypted = await encryptSecret(PUB_KEY, value);
-  const body = JSON.stringify({ encrypted_value: encrypted, key_id: KEY_ID });
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'api.github.com',
-      path: '/repos/' + OWNER + '/' + REPO + '/actions/secrets/' + name,
-      method: 'PUT',
-      headers: {
-        'Authorization': 'Bearer ' + GH_TOKEN,
-        'Content-Type': 'application/json',
-        'User-Agent': 'devops-agent',
-        'Content-Length': Buffer.byteLength(body)
-      }
-    }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve({name,status:res.statusCode})); });
-    req.on('error', reject); req.write(body); req.end();
-  });
-}
-
-(async () => {
-  for (const [name, value] of Object.entries(secrets)) {
-    const r = await putSecret(name, value);
-    console.log(r.status === 201 || r.status === 204 ? 'OK' : 'FAIL', r.name, r.status);
-  }
-})();
-"
+curl -s -X PATCH "$COOLIFY_URL/api/v1/applications/$UUID" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"is_auto_deploy_enabled\": true}"
 ```
 
-All three must show `OK`. If any shows `FAIL`: check the PAT has `repo` + `secrets` scopes.
-
-### 10.3 — Create the workflow file
-
-Create `.github/workflows/deploy.yml`. **All python3 calls must be single-line** — multiline python3 inside a `run: |` block breaks YAML parsing and causes the run to fail with zero jobs and no error message.
-
-Always validate YAML before committing:
-```bash
-python3 -c "import yaml; yaml.safe_load(open('.github/workflows/deploy.yml').read()); print('YAML valid')"
-```
-
-The workflow (copy exactly — do not modify the python3 lines to multiline):
-
-```yaml
-name: Deploy to CapRover
-
-on:
-  push:
-    branches: [main]
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Create tarball
-        run: |
-          tar -czf /tmp/deploy.tar.gz \
-            --exclude='.git' \
-            --exclude='node_modules' \
-            --exclude='data' \
-            --exclude='.next' \
-            --exclude='logs' \
-            .
-
-      - name: Login and deploy
-        run: |
-          TOKEN=$(curl -s -X POST "${{ secrets.CAPROVER_SERVER }}/api/v2/login" \
-            -H "Content-Type: application/json" \
-            -d "{\"password\": \"${{ secrets.CAPROVER_PASSWORD }}\"}" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
-
-          if [ -z "$TOKEN" ]; then
-            echo "Failed to get CapRover token"
-            exit 1
-          fi
-
-          RESULT=$(curl -s -X POST \
-            "${{ secrets.CAPROVER_SERVER }}/api/v2/user/apps/appData/${{ secrets.CAPROVER_APP_NAME }}" \
-            -H "x-captain-auth: $TOKEN" \
-            -F "sourceFile=@/tmp/deploy.tar.gz")
-          echo "Upload result: $RESULT"
-          echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0) if d.get('status')==100 else exit(1)"
-
-          for i in $(seq 1 36); do
-            BUILDING=$(curl -s \
-              "${{ secrets.CAPROVER_SERVER }}/api/v2/user/apps/appData/${{ secrets.CAPROVER_APP_NAME }}" \
-              -H "x-captain-auth: $TOKEN" \
-              | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['isAppBuilding'])")
-            echo "[$i] Building: $BUILDING"
-            [ "$BUILDING" = "False" ] && break
-            sleep 10
-          done
-
-          FAILED=$(curl -s \
-            "${{ secrets.CAPROVER_SERVER }}/api/v2/user/apps/appData/${{ secrets.CAPROVER_APP_NAME }}" \
-            -H "x-captain-auth: $TOKEN" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['isBuildFailed'])")
-
-          if [ "$FAILED" = "True" ]; then
-            echo "Build failed!"
-            exit 1
-          fi
-          echo "Deploy successful!"
-```
-
-### 10.4 — Commit and push
+### 10.2 — Manual redeploy (when you need to ship without a push)
 
 ```bash
-cd /path/to/project
-git config user.email "hailinh.leo@gmail.com"
-git config user.name "leonatez"
-git remote set-url origin "https://$GITHUB_PAT@github.com/$GITHUB_OWNER/$GITHUB_REPO.git"
-git pull --rebase origin main
-git add .github/workflows/deploy.yml
-git commit -m "Add GitHub Actions auto-deploy to CapRover"
-git push origin main
+curl -s "$COOLIFY_URL/api/v1/deploy?uuid=$BACKEND_UUID" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN"
 ```
 
-### 10.5 — Verify
+### 10.3 — Optional: deploy webhook for external CI
 
-```bash
-# Wait ~20s for GitHub to register the run, then check
-sleep 20
-curl -s -H "Authorization: Bearer $GITHUB_PAT" \
-  "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/actions/runs?per_page=1" \
-  | python3 -c "import sys,json; r=json.load(sys.stdin)['workflow_runs'][0]; print(r['name'], r['status'], r['conclusion'])"
-```
-
-If conclusion is `failure` with zero jobs: YAML parse error — re-validate the workflow file.
-If conclusion is `failure` with jobs: check logs via `GET /repos/$OWNER/$REPO/actions/jobs/$JOB_ID/logs`.
-
-Report to Boss Agent once conclusion is `success`.
+If a non-GitHub CI must trigger a deploy, Coolify exposes a per-app deploy webhook (Application → Webhooks in the UI) callable with the API token as a Bearer header. Prefer native git auto-deploy; only wire this up if explicitly required.
 
 ---
 
@@ -785,19 +611,20 @@ Report to Boss Agent once conclusion is `success`.
 
 | Mistake | Result | Fix |
 |---------|--------|-----|
-| Point cloudflared to app port (e.g. `localhost:8000`) | Connection refused | Always use `localhost:80` |
+| Point cloudflared to the Coolify dashboard port (`localhost:8000`) | App traffic hits the Coolify UI, not your app | App hostnames must point to `http://localhost:80` (Traefik); only `admin.$DOMAIN` points to 8000 |
+| Point cloudflared to a container's direct port | Connection refused / bypasses routing | Always `http://localhost:80` — Traefik routes by Host header |
 | Edit `~/.cloudflared/config.yml` | Changes ignored | Always edit `CLOUDFLARE_CONFIG_FILE` from machine-config |
 | Duplicate hostname in config | Second entry silently ignored | Grep before inserting |
 | Missing DNS CNAME | `curl` returns `000` | Create via Cloudflare API |
-| Deploy without setting `containerHttpPort` | nginx can't route | Always call update API before deploy |
-| Bake `.env` secrets into Docker image | Secrets in image layers | Set env vars in CapRover app config |
-| Forget to restart cloudflared after config edit | New hostname not active | Always `sudo systemctl restart cloudflared` |
-| Hardcode tunnel ID or domain | Breaks on other machines | Always read from `~/.claude/machine-config.md` |
-| Use wrong tarball upload endpoint | 404 from CapRover API | Correct endpoint: `POST /api/v2/user/apps/appData/[APP_NAME]` (app name in URL, not form field) |
-| Missing `output: 'standalone'` in next.config.mjs | Standalone Dockerfile fails silently | Always add it before building a Next.js Docker image |
-| No `public/` dir in repo with Next.js standalone | `COPY failed: stat app/public` build error | Add `mkdir -p /app/public` before `npm run build` in builder stage |
-| NEXT_PUBLIC_ vars only set as CapRover runtime env vars | Client bundle uses empty strings | CapRover buildArgs are silently ignored — use `.env.production` in the repo instead |
-| `hasPersistentData: false` for app with local disk writes | Data lost on every deploy/restart | Set `hasPersistentData: true` and configure a named volume |
-| Using `caprover/deploy-to-caprover` GitHub Action | "Set up job" failure — action not found | That action doesn't exist; use direct CapRover API calls (see Step 10) |
-| Multiline python3 inside `run:` block (unindented) | Workflow fails with zero jobs, no error shown | Keep all python3 calls single-line in workflow files; validate YAML before committing |
-| Forgetting `CAPROVER_PASSWORD` secret in GitHub repo | Login step gets empty token, upload returns 401 | Add `CAPROVER_PASSWORD` as a GitHub secret alongside `CAPROVER_SERVER` and `CAPROVER_APP_NAME` |
+| `is_force_https_enabled: true` behind the tunnel | Redirect loop (Traefik → https → Cloudflare → http → …) | Set `false`; Cloudflare terminates TLS, tunnel speaks http to Traefik |
+| App `domains` set to `https://...` or omitted | Traefik has no router for that Host → 404 | Set `domains: "http://[APP_NAME].$DOMAIN"` |
+| Wrong `ports_exposes` | Build OK but 502 — Traefik can't reach the app | Set it to the port the process actually listens on (uvicorn 8000, next 3000) |
+| No `start_command` for FastAPI under Nixpacks | Container builds then exits immediately | Set `start_command: uvicorn app.main:app --host 0.0.0.0 --port 8000` |
+| Wrong `base_directory` in a monorepo | "no buildable files found" build error | Point each app at its subdirectory |
+| Set env vars after `instant_deploy: true` | First build bakes empty `NEXT_PUBLIC_*` into the bundle | Create with `instant_deploy: false`, set envs, then `GET /deploy?...&force=true` |
+| Put a secret under a `NEXT_PUBLIC_` name | Secret shipped to the browser | Keep secrets on the backend app only, never `NEXT_PUBLIC_` |
+| Commit secrets to the repo for Coolify to read | Secrets in git history | Inject via Coolify env vars (`/envs/bulk`); they live only in Coolify |
+| Build a `.github/workflows/deploy.yml` | Redundant + conflicting deploys | Not needed — Coolify auto-deploys from git via its GitHub App webhook |
+| Hardcode tunnel ID, domain, or Coolify URL | Breaks on other machines | Always read from `~/.claude/machine-config.md` |
+| Store the Coolify token in a project repo | Token leak | Token is machine-scoped — keep it in `~/.claude/machine-config.md` (or untracked `.env`) |
+| Reuse a token without `deploy` scope | `GET /deploy` returns 401/403 | Mint a token with `read`, `read:sensitive`, `write`, `deploy` scopes |
