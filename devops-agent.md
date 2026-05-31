@@ -36,6 +36,7 @@ Extract and hold these values for use throughout this skill:
 - `DOMAIN` — root domain (e.g. `enginxlabs.com`)
 - `CLOUDFLARE_API_TOKEN` — if present in machine-config, use it. Otherwise read from project `.env`.
 - `CLOUDFLARE_ZONE_ID` — same: prefer machine-config, fall back to `.env`.
+- `GITHUB_PAT` — if present in machine-config, use it for GitHub API calls (reading/creating repos, pushing commits, managing repo secrets). Machine-scoped, local-only.
 
 ---
 

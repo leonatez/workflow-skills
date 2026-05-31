@@ -38,6 +38,15 @@ GITHUB_APP_UUID=
 
 ---
 
+## GitHub
+
+<!-- Personal Access Token for GitHub API calls (repo scope). Machine-scoped. -->
+<!-- Used for pushing commits, reading/creating repos, managing repo secrets, etc. -->
+<!-- This file is local-only and never committed. -->
+GITHUB_PAT=
+
+---
+
 ## Cloudflare Tunnel
 
 <!-- Your tunnel ID (find it in: cloudflared tunnel list) -->
