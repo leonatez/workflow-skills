@@ -62,12 +62,13 @@ CLOUDFLARE_CONFIG_FILE=/etc/cloudflared/config.yml
 DOMAIN=enginxlabs.com
 
 <!-- Cloudflare Zone ID (Cloudflare dashboard → domain → overview → right sidebar) -->
-<!-- Stored per-project in .env as CLOUDFLARE_ZONE_ID -->
-<!-- Do not store it here — use .env -->
+<!-- Machine-scoped: one zone per machine's root domain. -->
+CLOUDFLARE_ZONE_ID=
 
-<!-- Cloudflare API token -->
-<!-- Stored per-project in .env as CLOUDFLARE_API_TOKEN -->
-<!-- Do not store it here — use .env -->
+<!-- Cloudflare API token (scope: Zone → DNS → Edit, for this machine's domain) -->
+<!-- Mint at: Cloudflare dashboard → profile → API Tokens → Create Token → "Edit zone DNS" template -->
+<!-- Scope it to the specific zone (domain) only. -->
+CLOUDFLARE_API_TOKEN=
 
 ---
 
