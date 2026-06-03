@@ -161,7 +161,82 @@ install it on the GitHub account/org and grant access to the target repo.
 Then re-run deployment.
 ```
 
-> If the repo is **public**, you may instead use `POST /api/v1/applications/public` (no `github_app_uuid`). Everything else below is identical.
+> If the repo is **public**, you may use `POST /api/v1/applications/public` to *create* the app (no `github_app_uuid` needed for the creation call). However, **a GitHub App is still required for auto-deploy** — Coolify's webhook endpoint validates all push events using the GitHub App's HMAC secret regardless of repo visibility. Always complete Step 3.3 after connecting the GitHub App.
+
+---
+
+## Step 3.3 — Verify the GitHub App webhook URL (required for auto-deploy)
+
+Coolify bakes its own "App URL" into the GitHub App's webhook URL at creation time. **If Coolify's App URL setting is blank or set to the machine's raw IP** (the default when the setting is never configured), GitHub cannot reach Coolify — every push webhook returns 502 and auto-deploy silently never fires. Always verify this immediately after Step 3.2.
+
+### Get the GitHub App private key and app_id from Coolify
+
+```bash
+# Private key — the GitHub App key has id > 0 and is not a git SSH key
+curl -s "$COOLIFY_URL/api/v1/security/keys" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  | python3 -c "
+import sys, json
+keys = json.load(sys.stdin)
+key = next((k for k in keys if k['id'] > 0 and not k.get('is_git_related', False)), None)
+print(key['private_key'] if key else 'NOT_FOUND')
+"
+
+# App ID
+GITHUB_APP_ID=$(curl -s "$COOLIFY_URL/api/v1/github-apps" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  | python3 -c "import sys,json; apps=json.load(sys.stdin); print(next(a['app_id'] for a in apps if a.get('app_id')))")
+echo "App ID: $GITHUB_APP_ID"
+```
+
+### Check and fix the webhook URL
+
+Use a GitHub App JWT (RS256, signed with the private key) to call `GET /app/hook/config`. If the URL is not `https://admin.$DOMAIN/webhooks/source/github/events`, patch it with `PATCH /app/hook/config`:
+
+```python
+python3 << 'PYEOF'
+import time, json, base64, ssl, urllib.request
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
+
+PRIVATE_KEY_PEM = """[PASTE KEY FROM ABOVE]"""
+APP_ID = 0  # replace with GITHUB_APP_ID
+DOMAIN = "[DOMAIN from machine-config]"
+EXPECTED_URL = f"https://admin.{DOMAIN}/webhooks/source/github/events"
+
+def make_jwt():
+    now = int(time.time())
+    h = base64.urlsafe_b64encode(json.dumps({"alg":"RS256","typ":"JWT"}).encode()).rstrip(b'=').decode()
+    p = base64.urlsafe_b64encode(json.dumps({"iat":now-60,"exp":now+540,"iss":str(APP_ID)}).encode()).rstrip(b'=').decode()
+    msg = f"{h}.{p}".encode()
+    key = serialization.load_pem_private_key(PRIVATE_KEY_PEM.encode(), password=None, backend=default_backend())
+    sig = base64.urlsafe_b64encode(key.sign(msg, padding.PKCS1v15(), hashes.SHA256())).rstrip(b'=').decode()
+    return f"{h}.{p}.{sig}"
+
+ctx = ssl.create_default_context()
+headers = {"Authorization": f"Bearer {make_jwt()}", "Accept": "application/vnd.github+json", "User-Agent": "devops-agent"}
+
+req = urllib.request.Request("https://api.github.com/app/hook/config", headers=headers)
+with urllib.request.urlopen(req, context=ctx) as r:
+    current_url = json.loads(r.read()).get('url', '')
+print(f"Current webhook URL: {current_url}")
+
+if current_url == EXPECTED_URL:
+    print("✅ Webhook URL is correct — auto-deploy will work.")
+else:
+    print(f"❌ Wrong URL. Patching to: {EXPECTED_URL}")
+    body = json.dumps({"url": EXPECTED_URL, "content_type": "json", "insecure_ssl": "0"}).encode()
+    req = urllib.request.Request("https://api.github.com/app/hook/config", data=body, method="PATCH",
+        headers={**headers, "Authorization": f"Bearer {make_jwt()}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, context=ctx) as r:
+        print(f"Patched to: {json.loads(r.read()).get('url')}")
+PYEOF
+```
+
+**Permanent prevention:** Set Coolify's App URL once in the UI so all future GitHub Apps get the correct URL at creation time: Coolify dashboard → **Settings** → **App URL** → `https://admin.$DOMAIN`. This is a one-time setup per Coolify instance.
+
+Also verify auto-deploy is working end-to-end after deployment (Step 10.1) by checking recent GitHub App webhook deliveries — they should show `OK 200`, not `502 failed to connect to host`.
 
 ---
 
@@ -629,3 +704,5 @@ If a non-GitHub CI must trigger a deploy, Coolify exposes a per-app deploy webho
 | Hardcode tunnel ID, domain, or Coolify URL | Breaks on other machines | Always read from `~/.claude/machine-config.md` |
 | Store the Coolify token in a project repo | Token leak | Token is machine-scoped — keep it in `~/.claude/machine-config.md` (or untracked `.env`) |
 | Reuse a token without `deploy` scope | `GET /deploy` returns 401/403 | Mint a token with `read`, `read:sensitive`, `write`, `deploy` scopes |
+| Skip Coolify "App URL" setting before creating GitHub App | GitHub App webhook URL is set to the machine's raw IP (e.g. `http://116.x.x.x:8000`); GitHub returns 502 on every push; auto-deploy silently never fires | Set App URL once in Coolify Settings → App URL → `https://admin.$DOMAIN` **before** creating the GitHub App. If already created with wrong URL, fix via `PATCH /app/hook/config` using a JWT — see Step 3.3 |
+| Assume public repos don't need a GitHub App | Coolify's `/webhooks/source/github/events` uses GitHub App HMAC for all signature verification regardless of repo visibility; without a GitHub App the endpoint always returns "Invalid signature" and no deploy fires | Always connect a GitHub App in Coolify (Sources → + Add → GitHub App) even for public repos; verify Step 3.3 |
