@@ -243,11 +243,16 @@ Skip this step entirely if the project does not handle file uploads.
 
 **The same MinIO instance (`https://storage.enginxlabs.com`) is used in local development and in production.** There is no local MinIO to set up. This simplifies the workflow: whatever works locally will work in production with the exact same credentials.
 
-### Get credentials from DevOps Agent before writing any code
+### Get credentials from Boss Agent before writing any code
 
-Before implementing any file upload logic, request the DevOps Agent (via Boss Agent) to run **Step 0.5** — it creates the project bucket and a per-project service account and returns the credentials. Only then fill in the `.env` values below.
+Credentials are set up during Phase 0 (project prerequisites) — the Boss Agent handles this before development starts, either via the DevOps Agent (on the miniPC) or by guiding the user through the MinIO console. By the time Backend PM is activated, the four MinIO values should already be in `PROJECT_CONFIG.md`.
 
-**Never start writing upload code with placeholder credentials.** Wait for the real values from DevOps Agent.
+Read them from there:
+```bash
+grep MINIO PROJECT_CONFIG.md
+```
+
+Copy the four values into your local `.env`. If they are missing from `PROJECT_CONFIG.md`, stop and report `NEEDS_CONTEXT` to Boss Agent — do not proceed with placeholder values.
 
 ### Rules
 

@@ -10,11 +10,20 @@ The DevOps Agent owns deployment. It takes a QA-verified, signed-off feature and
 
 ## Step 0.5 — Project kickoff: MinIO bucket + service account (run at project start, not at deploy)
 
-**When to run:** The Boss Agent calls this step when a new project starts and the Backend PM reports that the project handles file uploads. This must complete before the Backend PM begins any file upload implementation — the Backend PM cannot write upload code without the bucket name and credentials.
+**When to run:** The Boss Agent calls this step when a new project starts and the project handles file uploads. This must complete before the Backend PM begins any file upload implementation.
 
 **This step is separate from deployment.** It runs once per project, early in the development phase, not during the deploy pipeline.
 
-Run Step 0 first (read machine-config), then execute this step and return the credentials to Boss Agent.
+**This step requires `DEPLOY_MODE=coolify-cloudflare`.** If called on a dev-only machine (`DEPLOY_MODE=none`), stop immediately and report to Boss Agent:
+
+```
+BLOCKED: Step 0.5 must run on the miniPC (DEPLOY_MODE=coolify-cloudflare).
+Boss Agent should guide the user to set up the bucket manually via the MinIO console:
+  https://minio.enginxlabs.com
+Instructions are in Boss Agent Phase 0, item 8.
+```
+
+Run Step 0 first (read machine-config and verify DEPLOY_MODE), then execute this step and return the credentials to Boss Agent.
 
 ### 0.5.1 — Verify MinIO is running
 
