@@ -266,6 +266,7 @@ Every file upload interaction must have all of these states designed in the mock
 - **Validate client-side first** (file type + size) for immediate feedback, but treat this as UX only — the backend validates authoritatively.
 - **Never construct MinIO URLs directly in the frontend.** All file URLs come from the API response. The backend is the only source of truth for where a file lives.
 - **`NEXT_PUBLIC_MINIO_ENDPOINT` is not needed** in the frontend — the backend returns the full public URL in its response.
+- Dev and production use the same MinIO server (`storage.enginxlabs.com`). Uploaded files in local development are real files on the shared server — this is intentional. Do not mock file storage in the frontend.
 - For image uploads, show a preview using `URL.createObjectURL(file)` before upload (client-side blob URL, no network call needed).
 - After a successful upload the API returns the public URL — replace the local blob preview with it.
 - Test cases must cover all error states above.

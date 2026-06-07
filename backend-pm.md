@@ -85,6 +85,10 @@ List every variable needed:
 |----------|-------------|---------|
 ```
 
+### Request MinIO setup if the project handles file uploads
+
+If any endpoint will accept file uploads, report this to Boss Agent immediately after `ARCHITECTURE.md` is drafted — before writing any code. Boss Agent will ask the DevOps Agent to run Step 0.5 (create bucket + service account) and return the MinIO credentials. You need those credentials in your `.env` before Step 3b.
+
 ### Validate with plan-eng-review
 
 After drafting `ARCHITECTURE.md`, run `/plan-eng-review` to pressure-test the design.
@@ -200,8 +204,10 @@ SUPABASE_ANON_KEY=xxx
 SUPABASE_SERVICE_ROLE_KEY=xxx    # Used only by Backend, never exposed to Frontend
 
 # File storage (MinIO) — only if the project handles file uploads
+# Same values for local dev AND production — one server, no environment switching
+# Credentials provided by DevOps Agent (Step 0.5) before development starts
 MINIO_ENDPOINT=https://storage.enginxlabs.com
-MINIO_ACCESS_KEY=xxx             # Per-project service account key (not root credentials)
+MINIO_ACCESS_KEY=xxx             # Per-project service account key — get from DevOps Agent
 MINIO_SECRET_KEY=xxx
 MINIO_BUCKET=[project-name]-uploads
 
@@ -232,6 +238,16 @@ This must be the first check that runs. No exceptions.
 ## Step 3b — File Storage (MinIO)
 
 Skip this step entirely if the project does not handle file uploads.
+
+### One server for both development and production
+
+**The same MinIO instance (`https://storage.enginxlabs.com`) is used in local development and in production.** There is no local MinIO to set up. This simplifies the workflow: whatever works locally will work in production with the exact same credentials.
+
+### Get credentials from DevOps Agent before writing any code
+
+Before implementing any file upload logic, request the DevOps Agent (via Boss Agent) to run **Step 0.5** — it creates the project bucket and a per-project service account and returns the credentials. Only then fill in the `.env` values below.
+
+**Never start writing upload code with placeholder credentials.** Wait for the real values from DevOps Agent.
 
 ### Rules
 
