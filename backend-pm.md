@@ -16,6 +16,7 @@ The Backend PM owns everything the user does not see: API design, data models, a
 | Database | Supabase (PostgreSQL) |
 | Auth / user management | Supabase Auth |
 | ORM / query | Supabase Python client or SQLAlchemy with Supabase connection string |
+| File storage | MinIO (S3-compatible, self-hosted at `storage.enginxlabs.com`) via `boto3` |
 | Environment config | `python-dotenv` + Pydantic `BaseSettings` |
 | Logging | Python `logging` module with structured JSON handler |
 
@@ -198,6 +199,12 @@ SUPABASE_URL=https://xxx.supabase.co
 SUPABASE_ANON_KEY=xxx
 SUPABASE_SERVICE_ROLE_KEY=xxx    # Used only by Backend, never exposed to Frontend
 
+# File storage (MinIO) — only if the project handles file uploads
+MINIO_ENDPOINT=https://storage.enginxlabs.com
+MINIO_ACCESS_KEY=xxx             # Per-project service account key (not root credentials)
+MINIO_SECRET_KEY=xxx
+MINIO_BUCKET=[project-name]-uploads
+
 # App
 APP_SECRET_KEY=xxx               # For any server-side signing
 LOG_LEVEL=DEBUG                  # DEBUG | INFO | WARNING | ERROR
@@ -219,6 +226,73 @@ if settings.TESTING_MODE and settings.ENVIRONMENT == "production":
 ```
 
 This must be the first check that runs. No exceptions.
+
+---
+
+## Step 3b — File Storage (MinIO)
+
+Skip this step entirely if the project does not handle file uploads.
+
+### Rules
+
+- **Client:** `boto3` (S3-compatible). Add `boto3` to `requirements.txt`.
+- **Bucket naming:** `[project-name]-uploads` — all lowercase, hyphens only.
+- **Never store the full URL in the database.** Store only the object key (e.g. `images/abc123.webp`). Construct the public URL at read time: `f"{settings.MINIO_ENDPOINT}/{settings.MINIO_BUCKET}/{object_key}"`.
+- **Never trust the client filename.** Generate a unique filename server-side: `f"{uuid4()}.{validated_ext}"`.
+- **Always validate** file type (allowlist: `jpg`, `png`, `webp`, `gif`, `pdf` — extend per project) and file size (default max 10 MB) before uploading.
+- **Credentials:** use a per-project MinIO service account (Access Key), not root credentials. DevOps Agent creates the bucket and service account — see DevOps Agent Step 4.5.
+
+### Upload pattern (in `services/[feature].py`)
+
+```python
+import boto3
+from botocore.client import Config
+from uuid import uuid4
+from pathlib import Path
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=settings.MINIO_ENDPOINT,
+    aws_access_key_id=settings.MINIO_ACCESS_KEY,
+    aws_secret_access_key=settings.MINIO_SECRET_KEY,
+    config=Config(signature_version="s3v4"),
+)
+
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif", "pdf"}
+MAX_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+async def upload_file(file: UploadFile, folder: str) -> str:
+    ext = Path(file.filename).suffix.lstrip(".").lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise ValueError(f"File type .{ext} not allowed")
+    content = await file.read()
+    if len(content) > MAX_SIZE_BYTES:
+        raise ValueError("File exceeds 10 MB limit")
+    object_key = f"{folder}/{uuid4()}.{ext}"
+    s3.put_object(
+        Bucket=settings.MINIO_BUCKET,
+        Key=object_key,
+        Body=content,
+        ContentType=file.content_type,
+    )
+    return object_key  # store this in the database
+```
+
+### Constructing public URL (in `schemas/` or `routers/`)
+
+```python
+def public_url(object_key: str) -> str:
+    return f"{settings.MINIO_ENDPOINT}/{settings.MINIO_BUCKET}/{object_key}"
+```
+
+### What to log for file uploads
+
+| Event | Level | Fields |
+|-------|-------|--------|
+| File upload success | INFO | request_id, object_key, size_bytes, content_type |
+| File type rejected | WARNING | request_id, filename, ext |
+| File too large | WARNING | request_id, size_bytes |
+| MinIO error | ERROR | request_id, exception |
 
 ---
 

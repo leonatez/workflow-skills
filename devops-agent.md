@@ -683,6 +683,95 @@ If a non-GitHub CI must trigger a deploy, Coolify exposes a per-app deploy webho
 
 ---
 
+## Step 4.5 — File Storage (MinIO bucket + service account)
+
+Run this step only if `PROJECT_CONFIG.md` states the app handles file uploads.
+
+This machine runs a self-hosted MinIO instance as the file storage backend:
+
+| Setting | Value |
+|---------|-------|
+| S3 API | `https://storage.enginxlabs.com` (port 9000 via Cloudflare tunnel) |
+| Console | `https://minio.enginxlabs.com` (port 9001 via Cloudflare tunnel) |
+| Data dir | `/mnt/storage/minio` (external SSD mounted at `/mnt/storage`) |
+| Docker container | `minio` — `docker ps | grep minio` to verify it's running |
+| Root credentials | in `~/.claude/machine-config.md` as `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` |
+
+### 4.5.1 — Verify MinIO is running
+
+```bash
+docker ps --filter name=minio --format "{{.Status}}"
+# Must show "Up ..." — if not: docker start minio
+# Verify data mount: df -h /mnt/storage
+```
+
+### 4.5.2 — Create a bucket for this project
+
+```bash
+# Read root credentials from machine-config
+MINIO_ROOT_USER=$(grep ^MINIO_ROOT_USER ~/.claude/machine-config.md | cut -d' ' -f2)
+MINIO_ROOT_PASSWORD=$(grep ^MINIO_ROOT_PASSWORD ~/.claude/machine-config.md | cut -d' ' -f2)
+BUCKET_NAME="[project-name]-uploads"
+
+# Create bucket via MinIO API
+curl -s -u "$MINIO_ROOT_USER:$MINIO_ROOT_PASSWORD" \
+  -X PUT "http://localhost:9000/$BUCKET_NAME"
+
+# Set public-read policy (for media files accessible via URL)
+curl -s -u "$MINIO_ROOT_USER:$MINIO_ROOT_PASSWORD" \
+  -X PUT "http://localhost:9000/$BUCKET_NAME?policy" \
+  -H "Content-Type: application/json" \
+  -d "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::$BUCKET_NAME/*\"]}]}"
+```
+
+If the project needs private files (presigned URLs only), skip the policy step.
+
+### 4.5.3 — Create a per-project service account
+
+Use the MinIO console (`https://minio.enginxlabs.com`) to create a dedicated Access Key:
+
+1. Login with root credentials from `~/.claude/machine-config.md`
+2. Identity → Service Accounts → Create service account
+3. Name it `[project-name]-svc`
+4. Copy the generated Access Key and Secret Key
+
+**Never inject root credentials into an app.** Always use a per-project service account.
+
+### 4.5.4 — Inject MinIO env vars into the backend app
+
+Add to the backend's Coolify env vars (Step 4.3 envs):
+
+```bash
+curl -s -X PATCH "$COOLIFY_URL/api/v1/applications/$BACKEND_UUID/envs/bulk" \
+  -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"data\": [
+    {\"key\": \"MINIO_ENDPOINT\", \"value\": \"https://storage.enginxlabs.com\"},
+    {\"key\": \"MINIO_ACCESS_KEY\", \"value\": \"[service-account-key]\"},
+    {\"key\": \"MINIO_SECRET_KEY\", \"value\": \"[service-account-secret]\"},
+    {\"key\": \"MINIO_BUCKET\", \"value\": \"$BUCKET_NAME\"}
+  ]}"
+```
+
+### 4.5.5 — If MinIO container is stopped (SSD disconnected)
+
+```bash
+# Check if external SSD is mounted
+df -h /mnt/storage 2>/dev/null || echo "SSD NOT MOUNTED"
+lsblk | grep sda
+
+# If unmounted, remount
+sudo mount /dev/sda1 /mnt/storage
+
+# Then start MinIO
+docker start minio
+docker logs minio --tail 20
+```
+
+Report to Boss Agent if the SSD is physically disconnected — MinIO cannot start without `/mnt/storage/minio`.
+
+---
+
 ## Common Mistakes — Never Do These
 
 | Mistake | Result | Fix |

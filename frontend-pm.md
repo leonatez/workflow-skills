@@ -243,6 +243,35 @@ For each screen, list the data the Frontend expects:
 
 ---
 
+## File Upload UX Rules
+
+Apply whenever a feature includes file upload (images, documents, etc.).
+
+### Required UX states
+
+Every file upload interaction must have all of these states designed in the mockup:
+
+| State | What to show |
+|-------|-------------|
+| Idle | Upload area (drag-and-drop zone or button) with accepted types and max size clearly labeled |
+| File selected | Preview (image thumbnail or filename + size for documents) + "Upload" / "Confirm" action |
+| Uploading | Progress indicator (bar or spinner) — user must know something is happening |
+| Success | Confirmation + the uploaded file displayed inline |
+| File type error | Inline error message: "Only JPG, PNG, WEBP, GIF, PDF files are accepted" |
+| File too large | Inline error message: "File must be under 10 MB" |
+| Network / server error | Inline error message with a retry option |
+
+### Rules
+
+- **Validate client-side first** (file type + size) for immediate feedback, but treat this as UX only — the backend validates authoritatively.
+- **Never construct MinIO URLs directly in the frontend.** All file URLs come from the API response. The backend is the only source of truth for where a file lives.
+- **`NEXT_PUBLIC_MINIO_ENDPOINT` is not needed** in the frontend — the backend returns the full public URL in its response.
+- For image uploads, show a preview using `URL.createObjectURL(file)` before upload (client-side blob URL, no network call needed).
+- After a successful upload the API returns the public URL — replace the local blob preview with it.
+- Test cases must cover all error states above.
+
+---
+
 ## Frontend PM role during QA
 
 When Boss Agent activates QA phase for a completed feature:
